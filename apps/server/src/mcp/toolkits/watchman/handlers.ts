@@ -176,6 +176,48 @@ const compactTvState = (states: ReadonlyMap<string, HaState>, entityId: string) 
   };
 };
 
+const compactHvacControllerState = (states: ReadonlyMap<string, HaState>) => {
+  const entity = states.get("sensor.watchman_hvac_controller");
+  if (!entity) return { state: "unavailable", missing: true };
+  const selectedAttributes: Record<string, unknown> = Object.fromEntries(
+    [
+      "mode",
+      "actuation_compiled_in",
+      "profile",
+      "computed_pair_mask",
+      "effective_pair_mask",
+      "effective_pair_count",
+      "setpoint_f",
+      "fan_mode",
+      "last_full_snapshot",
+    ].flatMap((name) => {
+      const value = entity.attributes[name];
+      return typeof value === "boolean" ||
+        (typeof value === "number" && Number.isFinite(value)) ||
+        typeof value === "string"
+        ? [[name, typeof value === "string" ? value.slice(0, 160) : value]]
+        : [];
+    }),
+  );
+  const pairStates = entity.attributes.pair_states;
+  if (pairStates && typeof pairStates === "object" && !Array.isArray(pairStates)) {
+    const selectedPairs = Object.fromEntries(
+      ["A", "B", "C", "D"].flatMap((pair) => {
+        const value = (pairStates as Record<string, unknown>)[pair];
+        return typeof value === "string" ? [[pair, value.slice(0, 40)]] : [];
+      }),
+    );
+    if (Object.keys(selectedPairs).length > 0) selectedAttributes.pair_states = selectedPairs;
+  }
+  return {
+    state: entity.state.slice(0, 120),
+    ...(Object.keys(selectedAttributes).length === 0 ? {} : { attributes: selectedAttributes }),
+    ...(entity.last_updated === undefined
+      ? {}
+      : { last_updated: entity.last_updated.slice(0, 64) }),
+  };
+};
+
 const stateValue = (states: ReadonlyMap<string, HaState>, entityId: string): string =>
   states.get(entityId)?.state ?? "unavailable";
 
@@ -232,7 +274,7 @@ const statusForArea = (
       requested_pairs: compactState(states, "input_select.hvac_requested_pairs"),
       guard_cap: compactState(states, "sensor.hvac_guard_cap"),
       controller_reason: compactState(states, "sensor.hvac_controller_reason"),
-      direct_controller: compactState(states, "sensor.watchman_hvac_controller"),
+      direct_controller: compactHvacControllerState(states),
       inverter_hall: {
         ...compactState(states, "climate.hvac_inverter_hall"),
         evidence: "cloud_reported",

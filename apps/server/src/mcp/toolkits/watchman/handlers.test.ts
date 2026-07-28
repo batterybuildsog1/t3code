@@ -56,6 +56,7 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
     readonly payload?: unknown;
   }> = [];
   const oversizedTvMetadata = "x".repeat(50_000);
+  const oversizedHvacMetadata = "y".repeat(50_000);
   const states = [
     state("input_select.hvac_mode", "Auto"),
     state("input_select.hvac_requested_pairs", "None"),
@@ -73,7 +74,26 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
     }),
     state("sensor.well_solar_controller", "HOLD", { safety_latch: null }),
     state("sensor.watchman_hvac_controller", "ready", {
+      mode: "shadow",
+      actuation_compiled_in: false,
+      profile: "off",
+      computed_pair_mask: "0b0000",
+      effective_pair_mask: "0b0000",
+      effective_pair_count: 0,
+      hall_effective: true,
+      setpoint_f: 74,
+      fan_mode: "medium",
+      last_full_snapshot: "2026-07-28T23:37:17.008873+00:00",
+      reason_chain: ["request:off"],
       pair_states: { A: "off", B: "off", C: "off", D: "full_on" },
+      heads: Object.fromEntries(
+        Array.from({ length: 8 }, (_, index) => [
+          index + 1,
+          { state: "off", debug: oversizedHvacMetadata },
+        ]),
+      ),
+      ha_cache: { debug: oversizedHvacMetadata },
+      arbitrary: oversizedHvacMetadata,
     }),
     ...["a", "b", "c", "d"].flatMap((screen) => [
       state(`media_player.tv_${screen}_streamer`, "on", {
@@ -177,6 +197,38 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
     expect(tvContent.observed.screen_d.panel.attributes).toEqual({ source: "HDMI" });
     const encodedTvStatus = yield* encodeJson(tvStatus.structuredContent);
     expect(encodedTvStatus.length).toBeLessThan(6_000);
+
+    const hvacStatus = yield* call("watchman_status", { area: "hvac" });
+    expect(hvacStatus.isError).toBe(false);
+    expect(hvacStatus.structuredContent).toMatchObject({
+      observed: {
+        direct_controller: {
+          state: "ready",
+          attributes: {
+            mode: "shadow",
+            actuation_compiled_in: false,
+            profile: "off",
+            computed_pair_mask: "0b0000",
+            effective_pair_mask: "0b0000",
+            effective_pair_count: 0,
+            setpoint_f: 74,
+            fan_mode: "medium",
+            last_full_snapshot: "2026-07-28T23:37:17.008873+00:00",
+            pair_states: { A: "off", B: "off", C: "off", D: "full_on" },
+          },
+        },
+      },
+    });
+    const encodedHvacStatus = yield* encodeJson(hvacStatus.structuredContent);
+    expect(encodedHvacStatus.length).toBeLessThan(6_000);
+    const hvacContent = hvacStatus.structuredContent as {
+      readonly observed: {
+        readonly direct_controller: { readonly attributes: Record<string, unknown> };
+      };
+    };
+    expect(hvacContent.observed.direct_controller.attributes).not.toHaveProperty("heads");
+    expect(hvacContent.observed.direct_controller.attributes).not.toHaveProperty("ha_cache");
+    expect(hvacContent.observed.direct_controller.attributes).not.toHaveProperty("arbitrary");
 
     const invalidSpeed = yield* call("watchman_water_control", {
       operation: "set_speed_cap",
