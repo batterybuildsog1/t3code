@@ -172,7 +172,7 @@ export function getAutoBootstrapDefaultModelSelection(
   return isWatchmanWorkspaceRoot(workspaceRoot, watchmanProjectRoot)
     ? {
         instanceId: ProviderInstanceId.make("opencode"),
-        model: "xai/grok-4.5",
+        model: "cerebras/zai-glm-4.7",
         options: [{ id: "agent", value: "watchman-control" }],
       }
     : {
