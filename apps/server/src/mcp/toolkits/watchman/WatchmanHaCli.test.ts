@@ -1,3 +1,4 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -44,5 +45,9 @@ it.effect("passes exact REST arguments to the existing watchman-ha helper", () =
       ],
       timeout: "30 seconds",
     });
-  }).pipe(Effect.provide(WatchmanHaCli.layer.pipe(Layer.provide(RunnerLayer))));
+  }).pipe(
+    Effect.provide(
+      WatchmanHaCli.layer.pipe(Layer.provide(RunnerLayer), Layer.provide(NodeServices.layer)),
+    ),
+  );
 });

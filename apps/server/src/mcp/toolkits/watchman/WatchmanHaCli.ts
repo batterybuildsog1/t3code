@@ -1,5 +1,6 @@
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
@@ -21,6 +22,7 @@ export class WatchmanHaCli extends Context.Service<
       path: string,
       payload?: unknown,
     ) => Effect.Effect<unknown, WatchmanHaCliError>;
+    readonly readWellRunHistory: () => Effect.Effect<unknown, WatchmanHaCliError>;
   }
 >()("t3/mcp/toolkits/watchman/WatchmanHaCli") {}
 
@@ -29,6 +31,7 @@ const decodeJson = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
 
 export const make = Effect.fn("WatchmanHaCli.make")(function* () {
   const runner = yield* ProcessRunner.ProcessRunner;
+  const fileSystem = yield* FileSystem.FileSystem;
   const command = process.env.WATCHMAN_HA_CLI?.trim() || "watchman-ha";
 
   const rest: WatchmanHaCli["Service"]["rest"] = Effect.fn("WatchmanHaCli.rest")(
@@ -69,7 +72,30 @@ export const make = Effect.fn("WatchmanHaCli.make")(function* () {
     },
   );
 
-  return WatchmanHaCli.of({ rest });
+  const readWellRunHistory: WatchmanHaCli["Service"]["readWellRunHistory"] = Effect.fn(
+    "WatchmanHaCli.readWellRunHistory",
+  )(function* () {
+    const raw = yield* fileSystem.readFileString("/homeassistant/drive_logs/runhistory.json").pipe(
+      Effect.mapError(
+        (cause) =>
+          new WatchmanHaCliError({
+            operation: "read well run history",
+            message: cause.message,
+          }),
+      ),
+    );
+    return yield* decodeJson(raw).pipe(
+      Effect.mapError(
+        () =>
+          new WatchmanHaCliError({
+            operation: "read well run history",
+            message: "runhistory.json contains invalid JSON.",
+          }),
+      ),
+    );
+  });
+
+  return WatchmanHaCli.of({ rest, readWellRunHistory });
 });
 
 export const layer = Layer.effect(WatchmanHaCli, make());

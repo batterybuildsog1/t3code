@@ -27,6 +27,21 @@ const HaState = Schema.Struct({
 type HaState = typeof HaState.Type;
 const HaStates = Schema.Array(HaState);
 const decodeStates = Schema.decodeUnknownEffect(HaStates);
+const WellRunHistory = Schema.Struct({
+  generated: Schema.String,
+  drives: Schema.Struct({
+    well: Schema.Struct({
+      running_now: Schema.Boolean,
+      today: Schema.Struct({
+        runtime_min: Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+        runs: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+        brief_cycles: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+      }),
+    }),
+  }),
+});
+const decodeWellRunHistory = Schema.decodeUnknownEffect(WellRunHistory);
+const WELL_RUN_HISTORY_MAX_AGE_SECONDS = 15 * 60;
 const mutationSemaphore = Effect.runSync(Semaphore.make(1));
 
 const screenLetters = ["a", "b", "c", "d"] as const;
@@ -257,17 +272,83 @@ const historyEntities = {
   site_load: "sensor.parallel_group_a_consumption_power",
   well_pressure: "sensor.well_pressure",
   well_frequency: "sensor.well_rsi_output_frequency",
-  well_runs: "binary_sensor.well_pump_running",
   hvac_mode: "input_select.hvac_mode",
 } as const;
+type HistoryMetric = keyof typeof historyEntities | "well_runs";
 
 const history = Effect.fn("WatchmanToolkit.history")(function* (input: {
-  readonly metric: keyof typeof historyEntities;
+  readonly metric: HistoryMetric;
   readonly days?: number | undefined;
 }) {
   const tool = "watchman_history";
   yield* requireCapability(tool);
   const cli = yield* WatchmanHaCli.WatchmanHaCli;
+  if (input.metric === "well_runs") {
+    if (input.days !== undefined && input.days !== 1) {
+      return yield* fail(
+        tool,
+        "unavailable",
+        "well_runs is the controller-produced summary for today; omit days or use days: 1.",
+      );
+    }
+    const raw = yield* controller(tool, cli.readWellRunHistory());
+    const runHistory = yield* decodeWellRunHistory(raw).pipe(
+      Effect.mapError(() =>
+        fail(tool, "invalid_response", "runhistory.json does not match the expected schema."),
+      ),
+    );
+    const generatedAtMs = Date.parse(runHistory.generated);
+    if (!Number.isFinite(generatedAtMs)) {
+      return yield* fail(
+        tool,
+        "invalid_response",
+        "runhistory.json has an invalid generated timestamp.",
+      );
+    }
+    const now = yield* DateTime.now;
+    const nowMs = DateTime.toEpochMillis(now);
+    if (generatedAtMs > nowMs) {
+      return yield* fail(
+        tool,
+        "invalid_response",
+        "runhistory.json has a future generated timestamp.",
+      );
+    }
+    const dataAgeSeconds = Math.round((nowMs - generatedAtMs) / 1_000);
+    if (dataAgeSeconds > WELL_RUN_HISTORY_MAX_AGE_SECONDS) {
+      return yield* fail(
+        tool,
+        "invalid_response",
+        `runhistory.json is stale (${dataAgeSeconds} seconds old).`,
+      );
+    }
+    const siteZone = "America/Denver";
+    const generatedLocalDate = DateTime.formatIsoDate(
+      DateTime.setZoneNamedUnsafe(DateTime.makeUnsafe(generatedAtMs), siteZone),
+    );
+    const currentLocalDate = DateTime.formatIsoDate(DateTime.setZoneNamedUnsafe(now, siteZone));
+    if (generatedLocalDate !== currentLocalDate) {
+      return yield* fail(
+        tool,
+        "invalid_response",
+        `runhistory.json is for ${generatedLocalDate}, not the current site date ${currentLocalDate}.`,
+      );
+    }
+    const today = runHistory.drives.well.today;
+    return {
+      source: "Watchman controller-derived run history",
+      data_age_seconds: dataAgeSeconds,
+      timezone: siteZone,
+      local_date: generatedLocalDate,
+      summary: {
+        ran: runHistory.drives.well.running_now || today.runs > 0 || today.runtime_min > 0,
+        runtime_minutes: today.runtime_min,
+        run_count: today.runs,
+        brief_cycles: today.brief_cycles,
+        currently_running: runHistory.drives.well.running_now,
+      },
+    };
+  }
   const days = input.days ?? 7;
   const start = DateTime.formatIso(DateTime.add(yield* DateTime.now, { days: -days }));
   const entityId = historyEntities[input.metric];

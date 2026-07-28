@@ -4,6 +4,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { McpSchema, McpServer } from "effect/unstable/ai";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import { WatchmanToolkitHandlersLive } from "./handlers.ts";
@@ -89,6 +90,7 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
   const CliLayer = Layer.succeed(
     WatchmanHaCli.WatchmanHaCli,
     WatchmanHaCli.WatchmanHaCli.of({
+      readWellRunHistory: () => Effect.die("unused"),
       rest: (method, path, payload) => {
         calls.push({ method, path, ...(payload === undefined ? {} : { payload }) });
         return method === "GET" ? freshStates(states) : Effect.succeed([]);
@@ -245,10 +247,119 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
   }).pipe(Effect.provide(TestLayer));
 });
 
+it.effect("returns only the fresh controller-produced well summary", () => {
+  let mode: "valid" | "missing" | "invalid" | "stale" | "future" | "previous_day" | "negative" =
+    "valid";
+  let reads = 0;
+  const CliLayer = Layer.succeed(
+    WatchmanHaCli.WatchmanHaCli,
+    WatchmanHaCli.WatchmanHaCli.of({
+      rest: () => Effect.die("well_runs must not query Recorder"),
+      readWellRunHistory: () => {
+        reads += 1;
+        if (mode === "missing") {
+          return new WatchmanHaCli.WatchmanHaCliError({
+            operation: "read well run history",
+            message: "runhistory.json is missing",
+          });
+        }
+        if (mode === "invalid") return Effect.succeed({ generated: "not enough fields" });
+        return DateTime.now.pipe(
+          Effect.map((now) => ({
+            generated: DateTime.formatIso(
+              DateTime.add(now, {
+                seconds:
+                  mode === "stale"
+                    ? -16 * 60
+                    : mode === "future"
+                      ? 60
+                      : mode === "previous_day"
+                        ? -10 * 60
+                        : -1,
+              }),
+            ),
+            drives: {
+              well: {
+                running_now: true,
+                today: {
+                  runtime_min: mode === "negative" ? -1 : 239.7,
+                  runs: 4,
+                  brief_cycles: 1,
+                  kwh: 123.45,
+                },
+                runs_24h: Array.from({ length: 100 }, () => ({
+                  large: "field omitted from tool result",
+                })),
+              },
+            },
+          })),
+        );
+      },
+    }),
+  );
+  const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
+    Layer.provide(WatchmanToolkitHandlersLive),
+    Layer.provide(CliLayer),
+    Layer.provideMerge(McpServer.McpServer.layer),
+  );
+
+  return Effect.gen(function* () {
+    yield* TestClock.setTime(
+      DateTime.toEpochMillis(DateTime.makeUnsafe("2026-07-29T06:05:00.000Z")),
+    );
+    const server = yield* McpServer.McpServer;
+    const call = (arguments_: Record<string, unknown>) =>
+      server
+        .callTool({ name: "watchman_history", arguments: arguments_ })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+
+    const expectedLocalDate = DateTime.formatIsoDate(
+      DateTime.setZoneNamedUnsafe(yield* DateTime.now, "America/Denver"),
+    );
+    const valid = yield* call({ metric: "well_runs", days: 1 });
+    expect(valid.isError).toBe(false);
+    expect(valid.structuredContent).toMatchObject({
+      source: "Watchman controller-derived run history",
+      timezone: "America/Denver",
+      local_date: expectedLocalDate,
+      summary: {
+        ran: true,
+        runtime_minutes: 239.7,
+        run_count: 4,
+        brief_cycles: 1,
+        currently_running: true,
+      },
+    });
+    expect(valid.structuredContent).not.toHaveProperty("runs_24h");
+    expect(valid.structuredContent).not.toHaveProperty("data");
+
+    const readsBeforeInvalidDays = reads;
+    expect((yield* call({ metric: "well_runs", days: 2 })).isError).toBe(true);
+    expect(reads).toBe(readsBeforeInvalidDays);
+
+    mode = "missing";
+    expect((yield* call({ metric: "well_runs" })).isError).toBe(true);
+    mode = "invalid";
+    expect((yield* call({ metric: "well_runs" })).isError).toBe(true);
+    mode = "stale";
+    expect((yield* call({ metric: "well_runs" })).isError).toBe(true);
+    mode = "future";
+    expect((yield* call({ metric: "well_runs" })).isError).toBe(true);
+    mode = "previous_day";
+    expect((yield* call({ metric: "well_runs" })).isError).toBe(true);
+    mode = "negative";
+    expect((yield* call({ metric: "well_runs" })).isError).toBe(true);
+  }).pipe(Effect.provide(TestLayer));
+});
+
 it.effect("rejects Watchman tools for a preview-only credential", () => {
   const PreviewOnlyLayer = Layer.succeed(
     WatchmanHaCli.WatchmanHaCli,
     WatchmanHaCli.WatchmanHaCli.of({
+      readWellRunHistory: () => Effect.die("must not read well history"),
       rest: () => Effect.die("must not call Home Assistant"),
     }),
   );
@@ -280,6 +391,7 @@ it.effect("keeps TV actions closed and TV receipts honest", () => {
   const CliLayer = Layer.succeed(
     WatchmanHaCli.WatchmanHaCli,
     WatchmanHaCli.WatchmanHaCli.of({
+      readWellRunHistory: () => Effect.die("unused"),
       rest: (method, path, payload) => {
         if (method === "POST") {
           posts.push({ path, ...(payload === undefined ? {} : { payload }) });
@@ -480,6 +592,7 @@ it.effect("serializes Watchman mutations across concurrent tool calls", () => {
   const CliLayer = Layer.succeed(
     WatchmanHaCli.WatchmanHaCli,
     WatchmanHaCli.WatchmanHaCli.of({
+      readWellRunHistory: () => Effect.die("unused"),
       rest: (method) =>
         method === "GET"
           ? freshStates([
