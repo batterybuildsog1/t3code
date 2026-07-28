@@ -125,6 +125,9 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
         "watchman_water_control",
       ].sort(),
     );
+    for (const { tool } of server.tools) {
+      expect(tool.inputSchema.type).toBe("object");
+    }
 
     const status = yield* call("watchman_status", { area: "water" });
     expect(status.isError).toBe(false);

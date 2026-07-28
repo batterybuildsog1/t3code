@@ -71,6 +71,17 @@ const hallCelsius = new Map([
 const fail = (tool: WatchmanToolName, reason: WatchmanControlError["reason"], message: string) =>
   new WatchmanControlError({ tool, reason, message });
 
+const irrelevantParameter = (
+  tool: WatchmanToolName,
+  input: Record<string, unknown>,
+  allowed: ReadonlyArray<string>,
+) => {
+  const unexpected = Object.keys(input).find((key) => !allowed.includes(key));
+  return unexpected
+    ? fail(tool, "controller", `${input.operation} does not accept ${unexpected}.`)
+    : undefined;
+};
+
 const requireCapability = Effect.fn("WatchmanToolkit.requireCapability")(function* (
   tool: WatchmanToolName,
 ) {
@@ -345,6 +356,17 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
 }) {
   const tool = "watchman_tv_control";
   yield* requireCapability(tool);
+  const allowed = {
+    dashboard: ["operation", "screen"],
+    open_url: ["operation", "screen", "url"],
+    launch_app: ["operation", "screen", "app"],
+    navigate: ["operation", "screen", "moves"],
+    input_text: ["operation", "screen", "text"],
+    volume: ["operation", "screen", "level", "muted"],
+    power: ["operation", "screen", "power"],
+  }[input.operation];
+  const irrelevant = irrelevantParameter(tool, input, allowed);
+  if (irrelevant) return yield* irrelevant;
   let targets = resolveScreens(input.screen);
   let requestedUrl: string | undefined;
   let requestedApp: string | undefined;
@@ -642,6 +664,20 @@ const hvacControl = Effect.fn("WatchmanToolkit.hvacControl")(function* (input: {
 }) {
   const tool = "watchman_hvac_control";
   yield* requireCapability(tool);
+  const allowed =
+    input.operation === "target"
+      ? ["operation", "target_f"]
+      : input.operation === "pairs"
+        ? ["operation", "heads", "action", "target_f", "fan_mode"]
+        : input.operation === "mode"
+          ? ["operation", "mode"]
+          : input.operation === "party"
+            ? input.action === "start"
+              ? ["operation", "action", "minutes", "target_f"]
+              : ["operation", "action"]
+            : ["operation", "hall_mode", "hall_setpoint_f"];
+  const irrelevant = irrelevantParameter(tool, input, allowed);
+  if (irrelevant) return yield* irrelevant;
   const before = yield* readStates(tool);
   let requestedPairs: string | undefined;
 
@@ -787,6 +823,12 @@ const waterControl = Effect.fn("WatchmanToolkit.waterControl")(function* (input:
 }) {
   const tool = "watchman_water_control";
   yield* requireCapability(tool);
+  const irrelevant = irrelevantParameter(
+    tool,
+    input,
+    input.operation === "set_speed_cap" ? ["operation", "max_hz"] : ["operation"],
+  );
+  if (irrelevant) return yield* irrelevant;
   if (input.operation === "set_speed_cap") {
     if (input.max_hz === undefined) {
       return yield* fail(tool, "controller", "set_speed_cap requires max_hz.");
