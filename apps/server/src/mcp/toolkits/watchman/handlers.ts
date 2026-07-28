@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
@@ -29,6 +30,24 @@ const decodeStates = Schema.decodeUnknownEffect(HaStates);
 const mutationSemaphore = Effect.runSync(Semaphore.make(1));
 
 const screenLetters = ["a", "b", "c", "d"] as const;
+type Screen = (typeof screenLetters)[number];
+type AppliedState = "verified" | "pending" | "rejected" | "unavailable";
+type ServiceCall = {
+  readonly domain: string;
+  readonly service: string;
+  readonly data: Record<string, unknown>;
+};
+const dashboardUrls: Record<Screen, string> = {
+  a: "https://watchman.sunhomes.io/switchboard.html#tv",
+  b: "https://watchman.sunhomes.io/display.html?screens=4&screen=2&deck=wall&interval=15",
+  c: "https://watchman.sunhomes.io/display.html?screens=4&screen=3&deck=wall&interval=15",
+  d: "https://watchman.sunhomes.io/display.html?screens=4&screen=4&deck=wall&interval=15",
+};
+const tvApps = {
+  prime_video: "com.amazon.amazonvideo.livingroom",
+  netflix: "com.netflix.ninja",
+  youtube: "com.google.android.youtube.tv",
+} as const;
 const pairHeads = {
   A: [1, 2],
   B: [3, 4],
@@ -91,6 +110,12 @@ const callService = Effect.fn("WatchmanToolkit.callService")(function* (
   yield* controller(tool, cli.rest("POST", `/api/services/${domain}/${service}`, data));
 });
 
+const service = (domain: string, name: string, data: Record<string, unknown>): ServiceCall => ({
+  domain,
+  service: name,
+  data,
+});
+
 const compactState = (states: ReadonlyMap<string, HaState>, entityId: string) => {
   const entity = states.get(entityId);
   return entity
@@ -104,6 +129,9 @@ const compactState = (states: ReadonlyMap<string, HaState>, entityId: string) =>
 
 const stateValue = (states: ReadonlyMap<string, HaState>, entityId: string): string =>
   states.get(entityId)?.state ?? "unavailable";
+
+const stateUnavailable = (states: ReadonlyMap<string, HaState>, entityId: string): boolean =>
+  !states.has(entityId) || ["unknown", "unavailable"].includes(stateValue(states, entityId));
 
 const attribute = (states: ReadonlyMap<string, HaState>, entityId: string, name: string): unknown =>
   states.get(entityId)?.attributes[name];
@@ -257,26 +285,60 @@ const resolveScreens = (
 
 const mutationResult = (input: {
   readonly requested: unknown;
-  readonly applied: "verified" | "pending" | "rejected" | "unavailable";
+  readonly accepted?: unknown;
+  readonly applied: AppliedState;
   readonly observed: unknown;
   readonly evidence: string;
   readonly safety?: unknown;
 }) => ({
   requested: input.requested,
-  accepted: input.applied !== "rejected" && input.applied !== "unavailable",
+  accepted: input.accepted ?? (input.applied !== "rejected" && input.applied !== "unavailable"),
   applied: input.applied,
   observed: input.observed,
   evidence: input.evidence,
   ...(input.safety === undefined ? {} : { safety: input.safety }),
 });
 
+const dispatchTv = Effect.fn("WatchmanToolkit.dispatchTv")(function* (
+  calls: ReadonlyArray<ServiceCall>,
+) {
+  let completed = 0;
+  for (const call of calls) {
+    const result = yield* Effect.result(
+      callService("watchman_tv_control", call.domain, call.service, call.data),
+    );
+    if (Result.isFailure(result)) {
+      if (completed === 0) return yield* result.failure;
+      return {
+        status: "partial" as const,
+        completed,
+        planned: calls.length,
+        error: result.failure.message,
+      };
+    }
+    completed += 1;
+  }
+  return true;
+});
+
 const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
-  readonly operation: "dashboard" | "open_url" | "navigate" | "volume" | "power";
+  readonly operation:
+    | "dashboard"
+    | "open_url"
+    | "launch_app"
+    | "navigate"
+    | "input_text"
+    | "volume"
+    | "power";
   readonly screen: "a" | "b" | "c" | "d" | "all";
   readonly url?: string | undefined;
+  readonly app?: keyof typeof tvApps | undefined;
   readonly moves?:
-    | ReadonlyArray<"up" | "down" | "left" | "right" | "select" | "back" | "home" | "play_pause">
+    | ReadonlyArray<
+        "up" | "down" | "left" | "right" | "select" | "back" | "home" | "search" | "play_pause"
+      >
     | undefined;
+  readonly text?: string | undefined;
   readonly level?: number | undefined;
   readonly muted?: boolean | undefined;
   readonly power?: "on" | "off" | undefined;
@@ -284,11 +346,18 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
   const tool = "watchman_tv_control";
   yield* requireCapability(tool);
   let targets = resolveScreens(input.screen);
+  let requestedUrl: string | undefined;
+  let requestedApp: string | undefined;
+  let dispatch: ReadonlyArray<ServiceCall>;
+  let refresh: ReadonlyArray<string> = [];
 
   if (input.operation === "dashboard") {
-    yield* callService(tool, "script", "turn_on", {
-      entity_id: targets.map((screen) => `script.tv_show_dashboard_${screen}`),
-    });
+    dispatch = [
+      service("script", "turn_on", {
+        entity_id: targets.map((screen) => `script.tv_show_dashboard_${screen}`),
+      }),
+    ];
+    refresh = targets.map((screen) => `sensor.rec_${screen}_current_page`);
   } else if (input.operation === "open_url") {
     if (!input.url) return yield* fail(tool, "controller", "open_url requires url.");
     const url = yield* Effect.try({
@@ -306,11 +375,28 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
     if (targets.length === 0) {
       return yield* fail(tool, "controller", "TV A is dedicated to the solar dashboard.");
     }
-    yield* callService(tool, "media_player", "play_media", {
-      entity_id: targets.map((screen) => `media_player.tv_${screen}_streamer`),
-      media_content_type: "url",
-      media_content_id: url.toString(),
-    });
+    requestedUrl = url.toString();
+    dispatch = [
+      service("media_player", "play_media", {
+        entity_id: targets.map((screen) => `media_player.tv_${screen}_streamer`),
+        media_content_type: "url",
+        media_content_id: requestedUrl,
+      }),
+    ];
+    refresh = targets.map((screen) => `sensor.rec_${screen}_current_page`);
+  } else if (input.operation === "launch_app") {
+    if (!input.app) return yield* fail(tool, "controller", "launch_app requires app.");
+    targets = targets.filter((screen) => screen !== "a");
+    if (targets.length === 0) {
+      return yield* fail(tool, "controller", "TV A is dedicated to the solar dashboard.");
+    }
+    requestedApp = tvApps[input.app];
+    dispatch = [
+      service("remote", "turn_on", {
+        entity_id: targets.map((screen) => `remote.tv_${screen}_streamer`),
+        activity: requestedApp,
+      }),
+    ];
   } else if (input.operation === "navigate") {
     if (input.screen === "all") {
       return yield* fail(tool, "controller", "Navigate exactly one TV at a time.");
@@ -327,57 +413,137 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
       select: "DPAD_CENTER",
       back: "BACK",
       home: "HOME",
+      search: "SEARCH",
       play_pause: "MEDIA_PLAY_PAUSE",
     };
-    yield* callService(tool, "remote", "send_command", {
-      entity_id: `remote.tv_${input.screen}_streamer`,
-      command: input.moves.map((move) => commands[move]),
-      delay_secs: 0.6,
-    });
+    dispatch = [
+      service("remote", "send_command", {
+        entity_id: `remote.tv_${input.screen}_streamer`,
+        command: input.moves.map((move) => commands[move]),
+        delay_secs: 0.6,
+      }),
+    ];
+  } else if (input.operation === "input_text") {
+    if (input.screen === "all") {
+      return yield* fail(tool, "controller", "Type into exactly one TV at a time.");
+    }
+    if (input.screen === "a") {
+      return yield* fail(tool, "controller", "TV A is dedicated to the solar dashboard.");
+    }
+    if (!input.text) return yield* fail(tool, "controller", "input_text requires text.");
+    dispatch = [
+      service("remote", "send_command", {
+        entity_id: `remote.tv_${input.screen}_streamer`,
+        command: `text:${input.text}`,
+      }),
+    ];
   } else if (input.operation === "volume") {
     if (input.level === undefined && input.muted === undefined) {
       return yield* fail(tool, "controller", "volume requires level or muted.");
     }
     const entities = targets.map((screen) => `media_player.tv_${screen}_streamer`);
+    const calls: Array<ServiceCall> = [];
     if (input.level !== undefined) {
-      yield* callService(tool, "media_player", "volume_set", {
-        entity_id: entities,
-        volume_level: input.level / 100,
-      });
+      calls.push(
+        service("media_player", "volume_set", {
+          entity_id: entities,
+          volume_level: input.level / 100,
+        }),
+      );
     }
     if (input.muted !== undefined) {
-      yield* callService(tool, "media_player", "volume_mute", {
-        entity_id: entities,
-        is_volume_muted: input.muted,
-      });
+      calls.push(
+        service("media_player", "volume_mute", {
+          entity_id: entities,
+          is_volume_muted: input.muted,
+        }),
+      );
     }
+    dispatch = calls;
   } else {
     if (!input.power) return yield* fail(tool, "controller", "power requires on or off.");
     if (input.power === "off") targets = targets.filter((screen) => screen !== "a");
     if (targets.length === 0) {
       return yield* fail(tool, "controller", "TV A cannot be powered off from Control mode.");
     }
-    if (input.power === "on") {
-      yield* callService(tool, "remote", "turn_on", {
-        entity_id: targets.map((screen) => `remote.tv_${screen}_streamer`),
-      });
-    } else {
-      yield* callService(tool, "media_player", "turn_off", {
-        entity_id: targets.map((screen) => `media_player.tv_${screen}_panel`),
-      });
-    }
+    dispatch = [
+      input.power === "on"
+        ? service("remote", "turn_on", {
+            entity_id: targets.map((screen) => `remote.tv_${screen}_streamer`),
+          })
+        : service("media_player", "turn_off", {
+            entity_id: targets.map((screen) => `media_player.tv_${screen}_panel`),
+          }),
+    ];
   }
 
-  const states = yield* readStates(tool);
+  const skipped = resolveScreens(input.screen).filter((screen) => !targets.includes(screen));
+  const requested = {
+    ...input,
+    effective_targets: targets,
+    ...(skipped.length === 0 ? {} : { skipped }),
+  };
+  const accepted = yield* dispatchTv(dispatch);
+  let refreshError: string | undefined;
+  if (refresh.length > 0) {
+    const refreshed = yield* Effect.result(
+      callService(tool, "homeassistant", "update_entity", { entity_id: refresh }),
+    );
+    if (Result.isFailure(refreshed)) refreshError = refreshed.failure.message;
+  }
+  const statesResult = yield* Effect.result(readStates(tool));
+  const observedAt = DateTime.formatIso(yield* DateTime.now);
+  if (Result.isFailure(statesResult)) {
+    return mutationResult({
+      requested,
+      accepted,
+      applied: "unavailable",
+      observed: {
+        source: "Home Assistant live state",
+        observed_at: observedAt,
+        state: null,
+        error: statesResult.failure.message,
+        ...(refreshError === undefined ? {} : { refresh_error: refreshError }),
+      },
+      evidence: "Home Assistant accepted at least part of the request, but readback failed.",
+      safety: { tv_a_policy: "dedicated_solar_dashboard" },
+    });
+  }
+  const states = statesResult.success;
   const observed = Object.fromEntries(
     targets.map((screen) => [
       screen,
       {
-        streamer: compactState(states, `media_player.tv_${screen}_streamer`),
-        panel: compactState(states, `media_player.tv_${screen}_panel`),
+        streamer: {
+          state: stateValue(states, `media_player.tv_${screen}_streamer`),
+          app_id: attribute(states, `media_player.tv_${screen}_streamer`, "app_id"),
+        },
+        panel: stateValue(states, `media_player.tv_${screen}_panel`),
+        current_page: stateValue(states, `sensor.rec_${screen}_current_page`),
+        foreground_app: stateValue(states, `sensor.rec_${screen}_foreground_app`),
+        streamer_screen: stateValue(states, `switch.rec_${screen}_screen`),
       },
     ]),
   );
+  const dashboardObserved =
+    input.operation === "dashboard" &&
+    targets.every(
+      (screen) => stateValue(states, `sensor.rec_${screen}_current_page`) === dashboardUrls[screen],
+    );
+  const urlObserved =
+    input.operation === "open_url" &&
+    requestedUrl !== undefined &&
+    targets.every(
+      (screen) => stateValue(states, `sensor.rec_${screen}_current_page`) === requestedUrl,
+    );
+  const appObserved =
+    input.operation === "launch_app" &&
+    requestedApp !== undefined &&
+    targets.every(
+      (screen) =>
+        stateValue(states, `sensor.rec_${screen}_foreground_app`) === requestedApp ||
+        attribute(states, `media_player.tv_${screen}_streamer`, "app_id") === requestedApp,
+    );
   const volumeVerified =
     input.operation === "volume" &&
     targets.every((screen) => {
@@ -391,24 +557,55 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
         (input.muted === undefined || observedMuted === input.muted)
       );
     });
-  const powerVerified =
-    input.operation === "power" &&
-    input.power === "off" &&
-    targets.every((screen) => stateValue(states, `media_player.tv_${screen}_panel`) === "off");
-  const applied = volumeVerified || powerVerified ? "verified" : "pending";
+  const requiredObserverUnavailable =
+    ((input.operation === "dashboard" || input.operation === "open_url") &&
+      targets.some((screen) => stateUnavailable(states, `sensor.rec_${screen}_current_page`))) ||
+    (input.operation === "launch_app" &&
+      targets.some(
+        (screen) =>
+          stateUnavailable(states, `sensor.rec_${screen}_foreground_app`) &&
+          typeof attribute(states, `media_player.tv_${screen}_streamer`, "app_id") !== "string",
+      ));
+  const applied =
+    accepted !== true
+      ? "pending"
+      : requiredObserverUnavailable
+        ? "unavailable"
+        : volumeVerified
+          ? "verified"
+          : "pending";
+  const streamerObserved = dashboardObserved || urlObserved || appObserved;
   return mutationResult({
-    requested: input,
+    requested,
+    accepted,
     applied,
-    observed,
+    observed: {
+      source: "Home Assistant live state",
+      observed_at: observedAt,
+      state: observed,
+      ...(refreshError === undefined ? {} : { refresh_error: refreshError }),
+    },
     evidence:
-      applied === "verified"
-        ? "Fresh Home Assistant state matches the requested volume, mute, or panel power state."
-        : input.operation === "navigate"
-          ? "Home Assistant accepted one non-retried remote sequence; physical focus is not observable."
-          : input.operation === "power" && input.power === "on"
-            ? "The wake request targeted the Streamer remote; panel wake and dashboard restoration remain pending."
-            : "Home Assistant accepted the closed request, but returned state does not prove the requested physical result yet.",
-    safety: { tv_a_policy: "dedicated_solar_dashboard" },
+      applied === "unavailable"
+        ? "The required TV observer entity is missing, unknown, or unavailable."
+        : accepted !== true
+          ? "Home Assistant accepted only part of the request; the overall result is not verified."
+          : applied === "verified"
+            ? "Fresh Home Assistant feedback matches the requested volume or mute state."
+            : streamerObserved
+              ? "The Streamer reports the requested page or foreground app, but panel visibility and active HDMI input are not directly observed."
+              : input.operation === "navigate" || input.operation === "input_text"
+                ? "Home Assistant accepted one non-retried remote input sequence; focus and typed text are not directly observable."
+                : input.operation === "volume"
+                  ? "The installed TV integration does not currently expose volume feedback, so acceptance is not physical verification."
+                  : "Home Assistant accepted the closed request, but the requested physical state was not directly observed.",
+    safety: {
+      tv_a_policy: "dedicated_solar_dashboard",
+      effective_targets: targets,
+      ...(skipped.length === 0 ? {} : { skipped }),
+      streamer_observed: streamerObserved,
+      visible_panel_observed: false,
+    },
   });
 });
 

@@ -74,6 +74,15 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
     ...["a", "b", "c", "d"].flatMap((screen) => [
       state(`media_player.tv_${screen}_streamer`, "on", { app_id: "de.ozerov.fully" }),
       state(`media_player.tv_${screen}_panel`, "on"),
+      state(`remote.tv_${screen}_streamer`, "on"),
+      state(
+        `sensor.rec_${screen}_current_page`,
+        screen === "d"
+          ? "https://example.com/video"
+          : `https://watchman.sunhomes.io/display.html?screen=${screen}`,
+      ),
+      state(`sensor.rec_${screen}_foreground_app`, "de.ozerov.fully"),
+      state(`switch.rec_${screen}_screen`, "on"),
     ]),
     ...["a", "b", "c", "d"].map((pair) => state(`binary_sensor.hvac_pair_${pair}_active`, "off")),
   ];
@@ -258,6 +267,207 @@ it.effect("rejects Watchman tools for a preview-only credential", () => {
         Effect.provideService(McpSchema.McpServerClient, client),
       );
     expect(result.isError).toBe(true);
+  }).pipe(Effect.provide(TestLayer));
+});
+
+it.effect("keeps TV actions closed and TV receipts honest", () => {
+  let mode: "normal" | "partial" | "first_failure" | "readback_failure" | "missing_observer" =
+    "partial";
+  const posts: Array<{ readonly path: string; readonly payload?: unknown }> = [];
+  const CliLayer = Layer.succeed(
+    WatchmanHaCli.WatchmanHaCli,
+    WatchmanHaCli.WatchmanHaCli.of({
+      rest: (method, path, payload) => {
+        if (method === "POST") {
+          posts.push({ path, ...(payload === undefined ? {} : { payload }) });
+          if (mode === "first_failure" && path === "/api/services/media_player/play_media") {
+            return new WatchmanHaCli.WatchmanHaCliError({
+              operation: `${method} ${path}`,
+              message: "first service call failed",
+            });
+          }
+          if (mode === "partial" && path === "/api/services/media_player/volume_mute") {
+            return new WatchmanHaCli.WatchmanHaCliError({
+              operation: `${method} ${path}`,
+              message: "second service call failed",
+            });
+          }
+          return Effect.succeed([]);
+        }
+        if (mode === "readback_failure") {
+          return new WatchmanHaCli.WatchmanHaCliError({
+            operation: `${method} ${path}`,
+            message: "state readback failed",
+          });
+        }
+        return freshStates([
+          state("media_player.tv_d_streamer", "on", {
+            app_id: "com.amazon.amazonvideo.livingroom",
+          }),
+          state("media_player.tv_d_panel", "off"),
+          state("remote.tv_d_streamer", "on"),
+          state(
+            "sensor.rec_d_current_page",
+            mode === "missing_observer" ? "unavailable" : "https://example.com/movie",
+          ),
+          state("switch.rec_d_screen", "on"),
+        ]);
+      },
+    }),
+  );
+  const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
+    Layer.provide(WatchmanToolkitHandlersLive),
+    Layer.provide(CliLayer),
+    Layer.provideMerge(McpServer.McpServer.layer),
+  );
+
+  return Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const call = (name: string, arguments_: Record<string, unknown>) =>
+      server
+        .callTool({ name, arguments: arguments_ })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+
+    const partial = yield* call("watchman_tv_control", {
+      operation: "volume",
+      screen: "d",
+      level: 20,
+      muted: true,
+    });
+    expect(partial.isError).toBe(false);
+    expect(partial.structuredContent).toMatchObject({
+      accepted: {
+        status: "partial",
+        completed: 1,
+        planned: 2,
+        error: "second service call failed",
+      },
+      applied: "pending",
+    });
+
+    mode = "first_failure";
+    const postsBeforeFailure = posts.length;
+    const firstFailure = yield* call("watchman_tv_control", {
+      operation: "open_url",
+      screen: "d",
+      url: "https://example.com/movie",
+    });
+    expect(firstFailure.isError).toBe(true);
+    expect(posts.slice(postsBeforeFailure).map(({ path }) => path)).toEqual([
+      "/api/services/media_player/play_media",
+    ]);
+
+    mode = "readback_failure";
+    const readbackFailure = yield* call("watchman_tv_control", {
+      operation: "power",
+      screen: "d",
+      power: "on",
+    });
+    expect(readbackFailure.isError).toBe(false);
+    expect(readbackFailure.structuredContent).toMatchObject({
+      accepted: true,
+      applied: "unavailable",
+      observed: { error: "state readback failed" },
+    });
+
+    mode = "normal";
+    const postsBeforeUrl = posts.length;
+    const url = yield* call("watchman_tv_control", {
+      operation: "open_url",
+      screen: "d",
+      url: "https://example.com/movie",
+    });
+    expect(url.isError).toBe(false);
+    expect(url.structuredContent).toMatchObject({
+      accepted: true,
+      applied: "pending",
+      safety: { streamer_observed: true, visible_panel_observed: false },
+    });
+    expect(posts.slice(postsBeforeUrl).map(({ path }) => path)).toEqual([
+      "/api/services/media_player/play_media",
+      "/api/services/homeassistant/update_entity",
+    ]);
+
+    const app = yield* call("watchman_tv_control", {
+      operation: "launch_app",
+      screen: "d",
+      app: "prime_video",
+    });
+    expect(app.isError).toBe(false);
+    expect(app.structuredContent).toMatchObject({
+      accepted: true,
+      applied: "pending",
+      safety: { streamer_observed: true, visible_panel_observed: false },
+    });
+    expect(posts.at(-1)).toMatchObject({
+      path: "/api/services/remote/turn_on",
+      payload: {
+        entity_id: ["remote.tv_d_streamer"],
+        activity: "com.amazon.amazonvideo.livingroom",
+      },
+    });
+
+    const powerOff = yield* call("watchman_tv_control", {
+      operation: "power",
+      screen: "d",
+      power: "off",
+    });
+    expect(powerOff.isError).toBe(false);
+    expect(powerOff.structuredContent).toMatchObject({
+      accepted: true,
+      applied: "pending",
+      safety: { visible_panel_observed: false },
+    });
+
+    const text = yield* call("watchman_tv_control", {
+      operation: "input_text",
+      screen: "d",
+      text: "Babe",
+    });
+    expect(text.isError).toBe(false);
+    expect(text.structuredContent).toMatchObject({ accepted: true, applied: "pending" });
+    expect(posts.at(-1)).toMatchObject({
+      path: "/api/services/remote/send_command",
+      payload: { entity_id: "remote.tv_d_streamer", command: "text:Babe" },
+    });
+
+    const search = yield* call("watchman_tv_control", {
+      operation: "navigate",
+      screen: "d",
+      moves: ["search"],
+    });
+    expect(search.isError).toBe(false);
+    expect(search.structuredContent).toMatchObject({ accepted: true, applied: "pending" });
+    expect(posts.at(-1)).toMatchObject({
+      path: "/api/services/remote/send_command",
+      payload: { entity_id: "remote.tv_d_streamer", command: ["SEARCH"] },
+    });
+
+    const all = yield* call("watchman_tv_control", {
+      operation: "open_url",
+      screen: "all",
+      url: "https://example.com/movie",
+    });
+    expect(all.isError).toBe(false);
+    expect(all.structuredContent).toMatchObject({
+      requested: { effective_targets: ["b", "c", "d"], skipped: ["a"] },
+      safety: { effective_targets: ["b", "c", "d"], skipped: ["a"] },
+    });
+
+    mode = "missing_observer";
+    const missingObserver = yield* call("watchman_tv_control", {
+      operation: "open_url",
+      screen: "d",
+      url: "https://example.com/movie",
+    });
+    expect(missingObserver.isError).toBe(false);
+    expect(missingObserver.structuredContent).toMatchObject({
+      accepted: true,
+      applied: "unavailable",
+    });
   }).pipe(Effect.provide(TestLayer));
 });
 

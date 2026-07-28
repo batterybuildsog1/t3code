@@ -68,7 +68,7 @@ export const WatchmanHistoryTool = readTool(
 export const WatchmanTvControlTool = mutationTool(
   Tool.make("watchman_tv_control", {
     description:
-      "Control the TV wall through closed Home Assistant targets. TV A allows dashboard, volume, mute, and power-on only; content and power-off are B-D operations. Resolve web/search content normally, then pass an HTTPS URL.",
+      "Control the TV wall through closed Home Assistant targets. TV A allows dashboard, volume, mute, and power-on only; 'all' content or power-off means all eligible flexible screens B-D and the receipt names skipped targets. Prime Video, Netflix, and YouTube can be launched directly. Search input is a separate non-retried remote sequence whose focus cannot be verified.",
     parameters: Schema.Union([
       Schema.Struct({
         operation: Schema.Literals(["dashboard"]),
@@ -80,11 +80,31 @@ export const WatchmanTvControlTool = mutationTool(
         url: Schema.String.check(Schema.isMaxLength(2048)),
       }),
       Schema.Struct({
+        operation: Schema.Literals(["launch_app"]),
+        screen: Schema.Literals(["b", "c", "d", "all"]),
+        app: Schema.Literals(["prime_video", "netflix", "youtube"]),
+      }),
+      Schema.Struct({
         operation: Schema.Literals(["navigate"]),
         screen: Schema.Literals(["b", "c", "d"]),
         moves: Schema.Array(
-          Schema.Literals(["up", "down", "left", "right", "select", "back", "home", "play_pause"]),
+          Schema.Literals([
+            "up",
+            "down",
+            "left",
+            "right",
+            "select",
+            "back",
+            "home",
+            "search",
+            "play_pause",
+          ]),
         ).check(Schema.isMinLength(1), Schema.isMaxLength(12)),
+      }),
+      Schema.Struct({
+        operation: Schema.Literals(["input_text"]),
+        screen: Schema.Literals(["b", "c", "d"]),
+        text: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(120)),
       }),
       Schema.Struct({
         operation: Schema.Literals(["volume"]),
