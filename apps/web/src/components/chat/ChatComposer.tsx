@@ -3123,6 +3123,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   <CompactComposerControlsMenu
                     activePlan={showPlanSidebarToggle}
                     interactionMode={interactionMode}
+                    {...(composerProviderState.watchmanAgentLabel
+                      ? { label: composerProviderState.watchmanAgentLabel }
+                      : {})}
                     planSidebarLabel={planSidebarLabel}
                     planSidebarOpen={planSidebarOpen}
                     runtimeMode={runtimeMode}

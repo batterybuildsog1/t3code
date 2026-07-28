@@ -32,6 +32,7 @@ export type ComposerProviderState = {
   provider: ProviderDriverKind;
   promptEffort: string | null;
   modelOptionsForDispatch: ReadonlyArray<ProviderOptionSelection> | undefined;
+  watchmanAgentLabel?: "Control" | "Developer";
   composerFrameClassName?: string;
   composerSurfaceClassName?: string;
   modelPickerIconClassName?: string;
@@ -81,6 +82,12 @@ export function getComposerProviderState(input: ComposerProviderStateInput): Com
     provider,
     promptEffort,
     modelOptionsForDispatch,
+    ...(watchmanAgent
+      ? {
+          watchmanAgentLabel:
+            watchmanAgent.value === WATCHMAN_CONTROL_AGENT ? "Control" : "Developer",
+        }
+      : {}),
     ...(ultrathinkActive
       ? {
           composerFrameClassName: "ultrathink-frame",

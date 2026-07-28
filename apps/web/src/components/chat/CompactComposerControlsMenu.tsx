@@ -15,6 +15,7 @@ import {
 export const CompactComposerControlsMenu = memo(function CompactComposerControlsMenu(props: {
   activePlan: boolean;
   interactionMode: ProviderInteractionMode;
+  label?: string;
   planSidebarLabel: string;
   planSidebarOpen: boolean;
   runtimeMode: RuntimeMode;
@@ -31,11 +32,14 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
           <Button
             size="sm"
             variant="ghost"
-            className="shrink-0 px-2 text-muted-foreground/70 hover:text-foreground/80"
-            aria-label="More composer controls"
+            className="shrink-0 gap-1.5 px-2 text-muted-foreground/70 hover:text-foreground/80"
+            aria-label={
+              props.label ? `More composer controls, ${props.label} mode` : "More composer controls"
+            }
           />
         }
       >
+        {props.label ? <span>{props.label}</span> : null}
         <EllipsisIcon aria-hidden="true" className="size-4" />
       </MenuTrigger>
       <MenuPopup align="start">

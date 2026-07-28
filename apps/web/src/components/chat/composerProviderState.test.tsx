@@ -156,6 +156,7 @@ describe("getComposerProviderState", () => {
     expect(state.modelOptionsForDispatch).toEqual(
       selections(["thinking", false], ["agent", "watchman-developer"]),
     );
+    expect(state.watchmanAgentLabel).toBe("Developer");
   });
 
   it("derives promptEffort from the first select descriptor and preserves all others for dispatch", () => {
