@@ -84,6 +84,22 @@ export function resolveDevRedirectUrl(devUrl: URL, requestUrl: URL): string {
   return redirectUrl.toString();
 }
 
+export function resolveStaticRequestPath(
+  requestPath: string,
+  publicBasePath: string,
+): string | null {
+  if (publicBasePath === "/") {
+    return requestPath === "/" ? "/index.html" : requestPath;
+  }
+  if (requestPath === publicBasePath || requestPath === `${publicBasePath}/`) {
+    return "/index.html";
+  }
+  if (!requestPath.startsWith(`${publicBasePath}/`)) {
+    return null;
+  }
+  return requestPath.slice(publicBasePath.length);
+}
+
 const authenticateRawRouteWithScope = (
   scope: typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope,
 ) =>
@@ -246,7 +262,14 @@ export const staticAndDevRouteLayer = HttpRouter.add(
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const staticRoot = path.resolve(staticDir);
-    const staticRequestPath = url.value.pathname === "/" ? "/index.html" : url.value.pathname;
+    const publicBasePath = config.publicBasePath ?? "/";
+    if (publicBasePath !== "/" && url.value.pathname === "/") {
+      return HttpServerResponse.redirect(publicBasePath, { status: 302 });
+    }
+    const staticRequestPath = resolveStaticRequestPath(url.value.pathname, publicBasePath);
+    if (staticRequestPath === null) {
+      return HttpServerResponse.text("Not Found", { status: 404 });
+    }
     const rawStaticRelativePath = staticRequestPath.replace(/^[/\\]+/, "");
     const hasRawLeadingParentSegment = rawStaticRelativePath.startsWith("..");
     const staticRelativePath = path.normalize(rawStaticRelativePath).replace(/^[/\\]+/, "");

@@ -1369,6 +1369,21 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("marks hosted browser session cookies Secure when configured", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest({ config: { browserSessionCookieSecure: true } });
+
+      const { response, cookie } = yield* bootstrapBrowserSession();
+
+      assert.equal(response.status, 200);
+      assert.isDefined(cookie);
+      assert.include(cookie ?? "", "; Secure");
+      assert.include(cookie ?? "", "; HttpOnly");
+      assert.include(cookie ?? "", "; SameSite=Lax");
+      assert.include(cookie ?? "", "; Path=/");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("exchanges a bootstrap grant for a scoped bearer access token", () =>
     Effect.gen(function* () {
       yield* buildAppUnderTest();

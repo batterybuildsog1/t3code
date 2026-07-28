@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { isLoopbackHostname, resolveDevRedirectUrl } from "./http.ts";
+import { isLoopbackHostname, resolveDevRedirectUrl, resolveStaticRequestPath } from "./http.ts";
 
 describe("http dev routing", () => {
   it("treats localhost and loopback addresses as local", () => {
@@ -23,5 +23,14 @@ describe("http dev routing", () => {
     expect(resolveDevRedirectUrl(devUrl, requestUrl)).toBe(
       "http://127.0.0.1:5173/pair?token=test-token",
     );
+  });
+
+  it("maps only the configured public base path into static files", () => {
+    expect(resolveStaticRequestPath("/", "/")).toBe("/index.html");
+    expect(resolveStaticRequestPath("/assets/app.js", "/")).toBe("/assets/app.js");
+    expect(resolveStaticRequestPath("/voice", "/voice")).toBe("/index.html");
+    expect(resolveStaticRequestPath("/voice/", "/voice")).toBe("/index.html");
+    expect(resolveStaticRequestPath("/voice/assets/app.js", "/voice")).toBe("/assets/app.js");
+    expect(resolveStaticRequestPath("/other", "/voice")).toBeNull();
   });
 });

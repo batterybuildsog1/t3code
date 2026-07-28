@@ -488,6 +488,7 @@ export class EnvironmentAuth extends Context.Service<
     ) => Effect.Effect<AuthWebSocketTicketResult, ServerAuthInternalError>;
     readonly issueStartupPairingUrl: (
       baseUrl: string,
+      publicBasePath?: string,
     ) => Effect.Effect<string, ServerAuthInternalError>;
   }
 >()("t3/auth/EnvironmentAuth") {}
@@ -908,11 +909,14 @@ export const make = Effect.gen(function* () {
       Effect.withSpan("EnvironmentAuth.revokeOtherClientSessions"),
     );
 
-  const issueStartupPairingUrl: EnvironmentAuth["Service"]["issueStartupPairingUrl"] = (baseUrl) =>
+  const issueStartupPairingUrl: EnvironmentAuth["Service"]["issueStartupPairingUrl"] = (
+    baseUrl,
+    publicBasePath = "/",
+  ) =>
     issueStartupPairingCredential().pipe(
       Effect.map((issued) => {
         const url = new URL(baseUrl);
-        url.pathname = "/pair";
+        url.pathname = publicBasePath === "/" ? "/pair" : `${publicBasePath}/pair`;
         url.searchParams.delete("token");
         url.hash = new URLSearchParams([["token", issued.credential]]).toString();
         return url.toString();

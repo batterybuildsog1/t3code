@@ -16,7 +16,11 @@ import {
 import * as NetService from "@t3tools/shared/Net";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { deriveServerPaths } from "../config.ts";
-import { resolveServerConfig, resolveServerWorkingDirectory } from "./config.ts";
+import {
+  normalizePublicBasePath,
+  resolveServerConfig,
+  resolveServerWorkingDirectory,
+} from "./config.ts";
 
 const deriveExplicitServerPaths = (baseDir: string, devUrl: URL | undefined) =>
   deriveServerPaths(baseDir, devUrl, { baseDirIsExplicit: true });
@@ -46,6 +50,13 @@ it("uses the Watchman project root as the server cwd unless the CLI overrides it
   );
 });
 
+it("normalizes the public base path", () => {
+  expect(normalizePublicBasePath("")).toBe("/");
+  expect(normalizePublicBasePath("/")).toBe("/");
+  expect(normalizePublicBasePath("voice")).toBe("/voice");
+  expect(normalizePublicBasePath("/voice/")).toBe("/voice");
+});
+
 it.layer(NodeServices.layer)("cli config resolution", (it) => {
   const defaultObservabilityConfig = {
     traceMinLevel: "Info",
@@ -58,6 +69,8 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
     otlpExportIntervalMs: 10_000,
     otlpServiceName: "t3-server",
     devAllowedOrigins: [],
+    publicBasePath: "/",
+    browserSessionCookieSecure: false,
   } as const;
 
   const openBootstrapFd = Effect.fn(function* (payload: DesktopBackendBootstrapValue) {
@@ -107,6 +120,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
                   VITE_DEV_SERVER_URL: "http://127.0.0.1:5173",
                   T3CODE_DEV_ALLOWED_ORIGINS:
                     "https://host.example.ts.net, https://phone.example.ts.net ",
+                  T3CODE_BROWSER_SESSION_COOKIE_SECURE: "true",
                   T3CODE_NO_BROWSER: "true",
                   T3CODE_AUTO_BOOTSTRAP_PROJECT_FROM_CWD: "false",
                   T3CODE_LOG_WS_EVENTS: "true",
@@ -130,6 +144,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
         staticDir: undefined,
         devUrl: new URL("http://127.0.0.1:5173"),
         devAllowedOrigins: ["https://host.example.ts.net", "https://phone.example.ts.net"],
+        browserSessionCookieSecure: true,
         noBrowser: true,
         startupPresentation: "browser",
         desktopBootstrapToken: undefined,

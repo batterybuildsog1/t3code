@@ -703,6 +703,7 @@ it.effect("decodes latest turn source proposed plan metadata when present", () =
   Effect.gen(function* () {
     const parsed = yield* decodeOrchestrationLatestTurn({
       turnId: "turn-2",
+      userMessageId: "msg-2",
       state: "running",
       requestedAt: "2026-01-01T00:00:00.000Z",
       startedAt: "2026-01-01T00:00:01.000Z",
@@ -717,6 +718,7 @@ it.effect("decodes latest turn source proposed plan metadata when present", () =
       threadId: "thread-1",
       planId: "plan-1",
     });
+    assert.strictEqual(parsed.userMessageId, "msg-2");
   }),
 );
 

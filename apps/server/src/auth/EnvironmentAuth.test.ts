@@ -163,8 +163,13 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
       const sessions = yield* SessionStore.SessionStore;
 
       const pairingUrl = yield* serverAuth.issueStartupPairingUrl("http://127.0.0.1:3773");
+      const nestedPairingUrl = yield* serverAuth.issueStartupPairingUrl(
+        "http://127.0.0.1:3773",
+        "/voice",
+      );
       const token = new URLSearchParams(new URL(pairingUrl).hash.slice(1)).get("token");
       const listedPairingLinks = yield* serverAuth.listPairingLinks();
+      expect(new URL(nestedPairingUrl).pathname).toBe("/voice/pair");
       expect(token).toBeTruthy();
       expect(
         listedPairingLinks.some(

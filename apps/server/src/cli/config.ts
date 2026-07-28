@@ -116,6 +116,10 @@ const EnvServerConfig = Config.all({
         .filter((entry) => entry.length > 0),
     ),
   ),
+  publicBasePath: Config.string("T3CODE_PUBLIC_BASE_PATH").pipe(Config.withDefault("/")),
+  browserSessionCookieSecure: Config.boolean("T3CODE_BROWSER_SESSION_COOKIE_SECURE").pipe(
+    Config.withDefault(false),
+  ),
   noBrowser: Config.boolean("T3CODE_NO_BROWSER").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
@@ -204,6 +208,15 @@ export function resolveServerWorkingDirectory(
 const resolveOptionPrecedence = <Value>(
   ...values: ReadonlyArray<Option.Option<Value>>
 ): Option.Option<Value> => Option.firstSomeOf(values);
+
+export function normalizePublicBasePath(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed === "" || trimmed === "/") {
+    return "/";
+  }
+  const withLeadingSlash = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  return withLeadingSlash.replace(/\/+$/u, "");
+}
 
 const loadPersistedObservabilitySettings = Effect.fn(function* (settingsPath: string) {
   const fs = yield* FileSystem.FileSystem;
@@ -349,6 +362,7 @@ export const resolveServerConfig = (
       () => 443,
     );
     const staticDir = devUrl ? undefined : yield* ServerConfig.resolveStaticDir();
+    const publicBasePath = normalizePublicBasePath(env.publicBasePath);
     const host = Option.getOrElse(
       resolveOptionPrecedence(
         normalizedFlags.host,
@@ -384,6 +398,8 @@ export const resolveServerConfig = (
       serverTracePath,
       host,
       staticDir,
+      publicBasePath,
+      browserSessionCookieSecure: env.browserSessionCookieSecure,
       devUrl,
       devAllowedOrigins: env.devAllowedOrigins,
       noBrowser,

@@ -14,6 +14,12 @@ describe("settings pairing URL helpers", () => {
     );
   });
 
+  it("keeps direct pairing below a nested public base", () => {
+    expect(resolveDesktopPairingUrl("https://watchman.sunhomes.io", "PAIRCODE", "/voice")).toBe(
+      "https://watchman.sunhomes.io/voice/pair#token=PAIRCODE",
+    );
+  });
+
   it("uses hosted pairing URLs for HTTPS endpoints", () => {
     vi.stubEnv("VITE_HOSTED_APP_URL", "https://preview.t3.codes");
 

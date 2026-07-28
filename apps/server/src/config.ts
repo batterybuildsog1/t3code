@@ -71,6 +71,8 @@ export class ServerConfig extends Context.Service<
     readonly cwd: string;
     readonly baseDir: string;
     readonly staticDir: string | undefined;
+    readonly publicBasePath?: string;
+    readonly browserSessionCookieSecure?: boolean;
     readonly devUrl: URL | undefined;
     readonly devAllowedOrigins: ReadonlyArray<string>;
     readonly noBrowser: boolean;
@@ -187,6 +189,8 @@ const makeTest = Effect.fn("ServerConfig.makeTest")(function* (
     host: undefined,
     desktopBootstrapToken: undefined,
     staticDir: undefined,
+    publicBasePath: "/",
+    browserSessionCookieSecure: false,
     devUrl,
     devAllowedOrigins: [],
     noBrowser: false,

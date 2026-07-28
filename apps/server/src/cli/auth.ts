@@ -1,5 +1,9 @@
 import {
   AuthAdministrativeScopes,
+  type AuthEnvironmentScope,
+  AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
+  AuthWatchmanVoiceScope,
   AuthSessionId,
   AuthStandardClientScopes,
 } from "@t3tools/contracts";
@@ -80,6 +84,26 @@ const tokenOnlyFlag = Flag.boolean("token-only").pipe(
   Flag.withDescription("Print only the issued bearer token."),
   Flag.withDefault(false),
 );
+
+const sessionAccessFlag = Flag.choice("access", [
+  "administrative",
+  "orchestration",
+  "voice",
+] as const).pipe(
+  Flag.withDescription(
+    "Token access: `administrative` for T3 management, `orchestration` for a headless agent client, or `voice` for the Watchman Control voice bridge.",
+  ),
+  Flag.withDefault("administrative"),
+);
+
+export function sessionScopesForAccess(
+  access: "administrative" | "orchestration" | "voice",
+): ReadonlyArray<AuthEnvironmentScope> {
+  if (access === "voice") return [AuthWatchmanVoiceScope];
+  return access === "orchestration"
+    ? [AuthOrchestrationReadScope, AuthOrchestrationOperateScope]
+    : AuthAdministrativeScopes;
+}
 
 const pairingCreateCommand = Command.make("create", {
   ...authLocationFlags,
@@ -164,6 +188,7 @@ const sessionIssueCommand = Command.make("issue", {
   ttl: ttlFlag,
   label: labelFlag,
   subject: subjectFlag,
+  access: sessionAccessFlag,
   tokenOnly: tokenOnlyFlag,
   json: jsonFlag,
 }).pipe(
@@ -174,7 +199,7 @@ const sessionIssueCommand = Command.make("issue", {
       (environmentAuth) =>
         Effect.gen(function* () {
           const issued = yield* environmentAuth.issueSession({
-            scopes: AuthAdministrativeScopes,
+            scopes: sessionScopesForAccess(flags.access),
             ...(Option.isSome(flags.ttl) ? { ttl: flags.ttl.value } : {}),
             ...(Option.isSome(flags.label) ? { label: flags.label.value } : {}),
             ...(Option.isSome(flags.subject) ? { subject: flags.subject.value } : {}),

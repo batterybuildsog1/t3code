@@ -6,6 +6,7 @@ export function getRouter(history: RouterHistory) {
   return createRouter({
     routeTree,
     history,
+    basepath: import.meta.env.BASE_URL,
     context: {},
   });
 }

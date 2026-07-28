@@ -89,9 +89,13 @@ export const resolveListeningPort = (address: unknown, fallbackPort: number): nu
   return fallbackPort;
 };
 
-export const buildPairingUrl = (connectionString: string, token: string): string => {
+export const buildPairingUrl = (
+  connectionString: string,
+  token: string,
+  publicBasePath = "/",
+): string => {
   const url = new URL(connectionString);
-  url.pathname = "/pair";
+  url.pathname = publicBasePath === "/" ? "/pair" : `${publicBasePath}/pair`;
   url.searchParams.delete("token");
   url.hash = new URLSearchParams([["token", token]]).toString();
   return url.toString();
@@ -143,6 +147,10 @@ export const issueHeadlessServeAccessInfo = Effect.fn("issueHeadlessServeAccessI
   return {
     connectionString,
     token: issued.credential,
-    pairingUrl: buildPairingUrl(connectionString, issued.credential),
+    pairingUrl: buildPairingUrl(
+      connectionString,
+      issued.credential,
+      serverConfig.publicBasePath ?? "/",
+    ),
   } satisfies HeadlessServeAccessInfo;
 });
