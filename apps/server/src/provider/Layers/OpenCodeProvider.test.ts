@@ -34,6 +34,7 @@ const runtimeMock = {
     runVersionError: null as Error | null,
     versionStdout: DEFAULT_VERSION_STDOUT,
     inventoryError: null as Error | null,
+    inventoryCwds: [] as Array<string>,
     closeCalls: 0,
     inventory: {
       providerList: { connected: [] as string[], all: [] as unknown[], default: {} },
@@ -44,6 +45,7 @@ const runtimeMock = {
     this.state.runVersionError = null;
     this.state.versionStdout = DEFAULT_VERSION_STDOUT;
     this.state.inventoryError = null;
+    this.state.inventoryCwds.length = 0;
     this.state.closeCalls = 0;
     this.state.inventory = {
       providerList: { connected: [], all: [] as unknown[], default: {} },
@@ -95,16 +97,22 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
           }),
         )
       : Effect.succeed(runtimeMock.state.inventory as OpenCodeInventory),
-  loadInventoryFromCli: () =>
-    runtimeMock.state.inventoryError
-      ? Effect.fail(
-          new OpenCodeRuntimeError({
-            operation: "loadInventoryFromCli",
-            detail: runtimeMock.state.inventoryError.message,
-            cause: runtimeMock.state.inventoryError,
-          }),
-        )
-      : Effect.succeed(runtimeMock.state.inventory as OpenCodeInventory),
+  loadInventoryFromCli: ({ cwd }) =>
+    Effect.sync(() => {
+      runtimeMock.state.inventoryCwds.push(cwd ?? "");
+    }).pipe(
+      Effect.andThen(
+        runtimeMock.state.inventoryError
+          ? Effect.fail(
+              new OpenCodeRuntimeError({
+                operation: "loadInventoryFromCli",
+                detail: runtimeMock.state.inventoryError.message,
+                cause: runtimeMock.state.inventoryError,
+              }),
+            )
+          : Effect.succeed(runtimeMock.state.inventory as OpenCodeInventory),
+      ),
+    ),
 };
 
 beforeEach(() => {
@@ -152,7 +160,7 @@ it.layer(testLayer)("checkOpenCodeProviderStatus", (it) => {
     }),
   );
 
-  it.effect("emits OpenCode variant defaults so trait picker can resolve a visible selection", () =>
+  it.effect("scopes the Watchman agent default and inventory to the requested workspace", () =>
     Effect.gen(function* () {
       runtimeMock.state.inventory = {
         providerList: {
@@ -181,11 +189,16 @@ it.layer(testLayer)("checkOpenCodeProviderStatus", (it) => {
         agents: [
           { name: "build", hidden: false, mode: "primary" },
           { name: "plan", hidden: false, mode: "primary" },
+          { name: "watchman-control", hidden: false, mode: "primary" },
         ],
       };
 
-      const snapshot = yield* checkOpenCodeProviderStatus(makeOpenCodeSettings(), process.cwd());
-      const model = snapshot.models.find((entry) => entry.slug === "openai/gpt-5.4");
+      const nonWatchmanSnapshot = yield* checkOpenCodeProviderStatus(
+        makeOpenCodeSettings(),
+        "/srv/t3",
+        { ...process.env, WATCHMAN_PROJECT_ROOT: "/srv/watchman" },
+      );
+      const model = nonWatchmanSnapshot.models.find((entry) => entry.slug === "openai/gpt-5.4");
 
       NodeAssert.ok(model);
       const variantDescriptor = model.capabilities?.optionDescriptors?.find(
@@ -204,6 +217,24 @@ it.layer(testLayer)("checkOpenCodeProviderStatus", (it) => {
         agentDescriptor.options.find((option) => option.isDefault === true)?.id,
         "build",
       );
+
+      const watchmanSnapshot = yield* checkOpenCodeProviderStatus(
+        makeOpenCodeSettings(),
+        "/srv/watchman",
+        { ...process.env, WATCHMAN_PROJECT_ROOT: "/srv/watchman" },
+      );
+      const watchmanModel = watchmanSnapshot.models.find(
+        (entry) => entry.slug === "openai/gpt-5.4",
+      );
+      const watchmanAgentDescriptor = watchmanModel?.capabilities?.optionDescriptors?.find(
+        (descriptor) => descriptor.id === "agent" && descriptor.type === "select",
+      );
+      NodeAssert.ok(watchmanAgentDescriptor && watchmanAgentDescriptor.type === "select");
+      NodeAssert.equal(
+        watchmanAgentDescriptor.options.find((option) => option.isDefault === true)?.id,
+        "watchman-control",
+      );
+      NodeAssert.deepEqual(runtimeMock.state.inventoryCwds, ["/srv/t3", "/srv/watchman"]);
     }),
   );
 

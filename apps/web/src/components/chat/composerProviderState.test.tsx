@@ -141,6 +141,23 @@ describe("getComposerProviderState", () => {
     });
   });
 
+  it("preserves the Watchman mode marker across native provider dispatch", () => {
+    const state = getComposerProviderState({
+      provider: PROVIDER,
+      model: MODEL,
+      models: modelWith([booleanDescriptor("thinking")]),
+      modelOptions: selections(
+        ["agent", "watchman-developer"],
+        ["effort", "max"],
+        ["thinking", false],
+      ),
+    });
+
+    expect(state.modelOptionsForDispatch).toEqual(
+      selections(["thinking", false], ["agent", "watchman-developer"]),
+    );
+  });
+
   it("derives promptEffort from the first select descriptor and preserves all others for dispatch", () => {
     const state = getComposerProviderState({
       provider: PROVIDER,

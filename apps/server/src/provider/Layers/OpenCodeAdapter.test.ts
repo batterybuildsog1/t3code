@@ -21,6 +21,7 @@ import {
   ProviderInstanceId,
   ThreadId,
 } from "@t3tools/contracts";
+import type { Agent } from "@opencode-ai/sdk/v2";
 import { createModelSelection } from "@t3tools/shared/model";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
@@ -38,6 +39,7 @@ import {
   makeOpenCodeAdapter,
   mergeOpenCodeAssistantText,
 } from "./OpenCodeAdapter.ts";
+import { WATCHMAN_CONTROL_AGENT, WATCHMAN_DEVELOPER_AGENT } from "../watchmanOpenCodeProfile.ts";
 
 // Test-local service tag so the rest of the file can keep using `yield* OpenCodeAdapter`.
 class OpenCodeAdapter extends Context.Service<OpenCodeAdapter, OpenCodeAdapterShape>()(
@@ -45,6 +47,26 @@ class OpenCodeAdapter extends Context.Service<OpenCodeAdapter, OpenCodeAdapterSh
 ) {}
 
 const asThreadId = (value: string): ThreadId => ThreadId.make(value);
+
+const makeWatchmanAgents = (): Array<Agent> => [
+  {
+    name: WATCHMAN_CONTROL_AGENT,
+    mode: "primary",
+    permission: [
+      { permission: "*", pattern: "*", action: "deny" },
+      { permission: "read", pattern: "*", action: "allow" },
+      { permission: "external_directory", pattern: "*", action: "deny" },
+      { permission: "doom_loop", pattern: "*", action: "deny" },
+    ],
+    options: {},
+  },
+  {
+    name: WATCHMAN_DEVELOPER_AGENT,
+    mode: "primary",
+    permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    options: {},
+  },
+];
 
 type MessageEntry = {
   info: {
@@ -64,6 +86,7 @@ const runtimeMock = {
     closeCalls: [] as string[],
     revertCalls: [] as Array<{ sessionID: string; messageID?: string }>,
     promptCalls: [] as Array<unknown>,
+    promptAsyncGate: null as Promise<void> | null,
     promptAsyncError: null as Error | null,
     closeError: null as Error | null,
     messages: [] as MessageEntry[],
@@ -74,6 +97,7 @@ const runtimeMock = {
     sessionDirectoryById: new Map<string, string>(),
     sessionUpdateCalls: [] as Array<{ sessionID: string; permission: unknown }>,
     forkCalls: [] as Array<{ sessionID: string; directory?: string }>,
+    agents: makeWatchmanAgents(),
   },
   reset() {
     this.state.startCalls.length = 0;
@@ -84,6 +108,7 @@ const runtimeMock = {
     this.state.closeCalls.length = 0;
     this.state.revertCalls.length = 0;
     this.state.promptCalls.length = 0;
+    this.state.promptAsyncGate = null;
     this.state.promptAsyncError = null;
     this.state.closeError = null;
     this.state.messages = [];
@@ -94,6 +119,7 @@ const runtimeMock = {
     this.state.sessionDirectoryById.clear();
     this.state.sessionUpdateCalls.length = 0;
     this.state.forkCalls.length = 0;
+    this.state.agents = makeWatchmanAgents();
   },
 };
 
@@ -179,6 +205,9 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
         },
         promptAsync: async (input: unknown) => {
           runtimeMock.state.promptCalls.push(input);
+          if (runtimeMock.state.promptAsyncGate) {
+            await runtimeMock.state.promptAsyncGate;
+          }
           if (runtimeMock.state.promptAsyncError) {
             throw runtimeMock.state.promptAsyncError;
           }
@@ -211,6 +240,9 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
             }
           })(),
         }),
+      },
+      app: {
+        agents: async () => ({ data: runtimeMock.state.agents }),
       },
     }) as unknown as ReturnType<OpenCodeRuntimeShape["createOpenCodeSdkClient"]>,
   loadOpenCodeInventory: () =>
@@ -273,6 +305,19 @@ const OpenCodeAdapterTestLayer = Layer.effect(
   Layer.provideMerge(NodeServices.layer),
 );
 
+const WatchmanWorkspaceOpenCodeAdapterTestLayer = Layer.effect(
+  OpenCodeAdapter,
+  makeOpenCodeAdapter(openCodeAdapterTestSettings, {
+    environment: { ...process.env, WATCHMAN_PROJECT_ROOT: process.cwd() },
+  }),
+).pipe(
+  Layer.provideMerge(Layer.succeed(OpenCodeRuntime, OpenCodeRuntimeTestDouble)),
+  Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+  Layer.provideMerge(ServerSettingsService.layerTest()),
+  Layer.provideMerge(providerSessionDirectoryTestLayer),
+  Layer.provideMerge(NodeServices.layer),
+);
+
 beforeEach(() => {
   runtimeMock.reset();
 });
@@ -298,6 +343,135 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       NodeAssert.deepEqual(runtimeMock.state.authHeaders, [
         `Basic ${btoa("opencode:secret-password")}`,
       ]);
+      NodeAssert.deepEqual(runtimeMock.state.sessionCreateInputs[0]?.permission, [
+        { permission: "*", pattern: "*", action: "allow" },
+      ]);
+    }),
+  );
+
+  it.effect("leaves session permissions neutral for Watchman Control and Developer agents", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadIds = [
+        asThreadId("thread-watchman-control"),
+        asThreadId("thread-watchman-developer"),
+      ] as const;
+
+      for (const [threadId, agent] of [
+        [threadIds[0], WATCHMAN_CONTROL_AGENT],
+        [threadIds[1], WATCHMAN_DEVELOPER_AGENT],
+      ] as const) {
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("opencode"),
+            "cerebras/zai-glm-4.7",
+            [{ id: "agent", value: agent }],
+          ),
+        });
+      }
+
+      NodeAssert.deepEqual(
+        runtimeMock.state.sessionCreateInputs.map((input) => input.permission),
+        [[], []],
+      );
+      yield* Effect.forEach(threadIds, (threadId) => adapter.stopSession(threadId), {
+        discard: true,
+      });
+    }),
+  );
+
+  it.effect("refuses Watchman Control when its OpenCode profile is absent", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      runtimeMock.state.agents = runtimeMock.state.agents.filter(
+        (agent) => agent.name !== WATCHMAN_CONTROL_AGENT,
+      );
+
+      const exit = yield* Effect.exit(
+        adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId: asThreadId("thread-watchman-missing-profile"),
+          runtimeMode: "full-access",
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("opencode"),
+            "xai/grok-4.5",
+            [{ id: "agent", value: WATCHMAN_CONTROL_AGENT }],
+          ),
+        }),
+      );
+
+      NodeAssert.equal(Exit.isFailure(exit), true);
+      NodeAssert.deepEqual(runtimeMock.state.sessionCreateInputs, []);
+    }),
+  );
+
+  it.effect("refuses a permissive Watchman Control profile", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      runtimeMock.state.agents = runtimeMock.state.agents.map((agent) =>
+        agent.name === WATCHMAN_CONTROL_AGENT
+          ? {
+              ...agent,
+              permission: [{ permission: "*", pattern: "*", action: "allow" }],
+            }
+          : agent,
+      );
+
+      const exit = yield* Effect.exit(
+        adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId: asThreadId("thread-watchman-permissive-profile"),
+          runtimeMode: "full-access",
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("opencode"),
+            "xai/grok-4.5",
+            [{ id: "agent", value: WATCHMAN_CONTROL_AGENT }],
+          ),
+        }),
+      );
+
+      NodeAssert.equal(Exit.isFailure(exit), true);
+      NodeAssert.deepEqual(runtimeMock.state.sessionCreateInputs, []);
+    }),
+  );
+
+  it.effect("revalidates the Watchman profile when switching agents", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-watchman-profile-switch");
+      const selection = (agent: string) =>
+        createModelSelection(ProviderInstanceId.make("opencode"), "xai/grok-4.5", [
+          { id: "agent", value: agent },
+        ]);
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+        modelSelection: selection(WATCHMAN_DEVELOPER_AGENT),
+      });
+      runtimeMock.state.agents = runtimeMock.state.agents.map((agent) =>
+        agent.name === WATCHMAN_CONTROL_AGENT
+          ? {
+              ...agent,
+              permission: [{ permission: "*", pattern: "*", action: "allow" }],
+            }
+          : agent,
+      );
+
+      const error = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "Switch to household control",
+          modelSelection: selection(WATCHMAN_CONTROL_AGENT),
+        })
+        .pipe(Effect.flip);
+
+      NodeAssert.equal(error._tag, "ProviderAdapterValidationError");
+      NodeAssert.deepEqual(runtimeMock.state.promptCalls, []);
+      yield* adapter.stopSession(threadId);
     }),
   );
 
@@ -348,6 +522,71 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       NodeAssert.equal(runtimeMock.state.sessionUpdateCalls.length, 1);
       NodeAssert.equal(runtimeMock.state.sessionUpdateCalls[0]?.sessionID, "ses_persisted");
       NodeAssert.equal(runtimeMock.state.sessionUpdateCalls[0]?.permission != null, true);
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("does not adopt a legacy runtime-permission session as Watchman Control", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-watchman-legacy-resume");
+
+      const session = yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+        resumeCursor: { schemaVersion: 1, sessionId: "ses_runtime_permissions" },
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "cerebras/zai-glm-4.7",
+          [{ id: "agent", value: WATCHMAN_CONTROL_AGENT }],
+        ),
+      });
+
+      NodeAssert.deepEqual(runtimeMock.state.sessionGetIds, []);
+      NodeAssert.deepEqual(runtimeMock.state.sessionCreateInputs[0]?.permission, []);
+      NodeAssert.deepEqual(session.resumeCursor, {
+        schemaVersion: 1,
+        sessionId: "http://127.0.0.1:9999/session",
+        permissionProfile: "watchman",
+      });
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("resumes a Watchman permission-profile session with neutral session rules", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-watchman-profile-resume");
+
+      const session = yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+        resumeCursor: {
+          schemaVersion: 1,
+          sessionId: "ses_watchman",
+          permissionProfile: "watchman",
+        },
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "cerebras/zai-glm-4.7",
+          [{ id: "agent", value: WATCHMAN_DEVELOPER_AGENT }],
+        ),
+      });
+
+      NodeAssert.deepEqual(runtimeMock.state.sessionGetIds, ["ses_watchman"]);
+      NodeAssert.deepEqual(runtimeMock.state.sessionCreateInputs, []);
+      NodeAssert.deepEqual(runtimeMock.state.sessionUpdateCalls, [
+        { sessionID: "ses_watchman", permission: [] },
+      ]);
+      NodeAssert.deepEqual(session.resumeCursor, {
+        schemaVersion: 1,
+        sessionId: "ses_watchman",
+        permissionProfile: "watchman",
+      });
 
       yield* adapter.stopSession(threadId);
     }),
@@ -806,6 +1045,334 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const session = sessions.find((entry) => entry.threadId === threadId);
       NodeAssert.equal(session?.status, "running");
       NodeAssert.equal(String(session?.activeTurnId), String(turn.turnId));
+    }),
+  );
+
+  it.effect("keeps Watchman Control selected for same-mode steering and fallback turns", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-watchman-control-steer");
+      const controlSelection = createModelSelection(
+        ProviderInstanceId.make("opencode"),
+        "cerebras/zai-glm-4.7",
+        [{ id: "agent", value: WATCHMAN_CONTROL_AGENT }],
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+        modelSelection: controlSelection,
+      });
+
+      const first = yield* adapter.sendTurn({
+        threadId,
+        input: "Inspect the power state",
+        modelSelection: controlSelection,
+      });
+      const steered = yield* adapter.sendTurn({
+        threadId,
+        input: "Include the recent trend",
+      });
+
+      NodeAssert.equal(String(steered.turnId), String(first.turnId));
+      NodeAssert.deepEqual(
+        runtimeMock.state.promptCalls.map((call) => (call as { readonly agent?: string }).agent),
+        [WATCHMAN_CONTROL_AGENT, WATCHMAN_CONTROL_AGENT],
+      );
+    }),
+  );
+
+  it.effect("keeps the previous Watchman agent when a mode-switch prompt is rejected", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-watchman-rejected-switch");
+      const selection = (agent: string) =>
+        createModelSelection(ProviderInstanceId.make("opencode"), "xai/grok-4.5", [
+          { id: "agent", value: agent },
+        ]);
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+        modelSelection: selection(WATCHMAN_DEVELOPER_AGENT),
+      });
+
+      runtimeMock.state.promptAsyncError = new Error("switch rejected");
+      yield* adapter
+        .sendTurn({
+          threadId,
+          input: "Switch to Control",
+          modelSelection: selection(WATCHMAN_CONTROL_AGENT),
+        })
+        .pipe(Effect.flip);
+      runtimeMock.state.promptAsyncError = null;
+      yield* adapter.sendTurn({
+        threadId,
+        input: "Continue in the prior mode",
+      });
+
+      NodeAssert.deepEqual(
+        runtimeMock.state.promptCalls.map((call) => (call as { readonly agent?: string }).agent),
+        [WATCHMAN_CONTROL_AGENT, WATCHMAN_DEVELOPER_AGENT],
+      );
+    }),
+  );
+
+  it.effect("rejects a Control to Developer transition while the Control turn is active", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-watchman-active-boundary");
+      const selection = (agent: string) =>
+        createModelSelection(ProviderInstanceId.make("opencode"), "cerebras/zai-glm-4.7", [
+          { id: "agent", value: agent },
+        ]);
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+        modelSelection: selection(WATCHMAN_CONTROL_AGENT),
+      });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "Inspect the site",
+        modelSelection: selection(WATCHMAN_CONTROL_AGENT),
+      });
+
+      const error = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "Now edit the implementation",
+          modelSelection: selection(WATCHMAN_DEVELOPER_AGENT),
+        })
+        .pipe(Effect.flip);
+
+      NodeAssert.equal(error._tag, "ProviderAdapterValidationError");
+      if (error._tag !== "ProviderAdapterValidationError") {
+        throw new Error("Unexpected error type");
+      }
+      NodeAssert.equal(
+        error.issue,
+        "Wait for or interrupt the active turn before switching between Watchman Control and Developer.",
+      );
+      NodeAssert.equal(runtimeMock.state.promptCalls.length, 1);
+    }),
+  );
+
+  it.effect("rejects a Developer to Control transition while the Developer turn is active", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-watchman-active-developer-boundary");
+      const selection = (agent: string) =>
+        createModelSelection(ProviderInstanceId.make("opencode"), "cerebras/zai-glm-4.7", [
+          { id: "agent", value: agent },
+        ]);
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+        modelSelection: selection(WATCHMAN_DEVELOPER_AGENT),
+      });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "Inspect and edit the implementation",
+        modelSelection: selection(WATCHMAN_DEVELOPER_AGENT),
+      });
+
+      const error = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "Switch back to household control",
+          modelSelection: selection(WATCHMAN_CONTROL_AGENT),
+        })
+        .pipe(Effect.flip);
+
+      NodeAssert.equal(error._tag, "ProviderAdapterValidationError");
+      NodeAssert.equal(runtimeMock.state.promptCalls.length, 1);
+    }),
+  );
+
+  it.effect("switches Control to Developer and back in one session after each turn stops", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-watchman-completed-mode-switch");
+      const selection = (agent: string) =>
+        createModelSelection(ProviderInstanceId.make("opencode"), "cerebras/zai-glm-4.7", [
+          { id: "agent", value: agent },
+        ]);
+      const started = yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+        modelSelection: selection(WATCHMAN_CONTROL_AGENT),
+      });
+
+      for (const [agent, input] of [
+        [WATCHMAN_CONTROL_AGENT, "Read the site"],
+        [WATCHMAN_DEVELOPER_AGENT, "Repair the implementation"],
+        [WATCHMAN_CONTROL_AGENT, "Read the repaired site"],
+      ] as const) {
+        const turn = yield* adapter.sendTurn({
+          threadId,
+          input,
+          modelSelection: selection(agent),
+        });
+        yield* adapter.interruptTurn(threadId, turn.turnId);
+      }
+
+      NodeAssert.deepEqual(
+        runtimeMock.state.promptCalls.map((call) => (call as { readonly agent?: string }).agent),
+        [WATCHMAN_CONTROL_AGENT, WATCHMAN_DEVELOPER_AGENT, WATCHMAN_CONTROL_AGENT],
+      );
+      NodeAssert.deepEqual(
+        runtimeMock.state.promptCalls.map(
+          (call) => (call as { readonly sessionID?: string }).sessionID,
+        ),
+        [
+          "http://127.0.0.1:9999/session",
+          "http://127.0.0.1:9999/session",
+          "http://127.0.0.1:9999/session",
+        ],
+      );
+      NodeAssert.deepEqual(started.resumeCursor, {
+        schemaVersion: 1,
+        sessionId: "http://127.0.0.1:9999/session",
+        permissionProfile: "watchman",
+      });
+    }),
+  );
+
+  it.effect("serializes concurrent Control and Developer dispatch at the mode boundary", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-watchman-concurrent-boundary");
+      const selection = (agent: string) =>
+        createModelSelection(ProviderInstanceId.make("opencode"), "cerebras/zai-glm-4.7", [
+          { id: "agent", value: agent },
+        ]);
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+        modelSelection: selection(WATCHMAN_CONTROL_AGENT),
+      });
+
+      const results = yield* Effect.all(
+        [
+          adapter
+            .sendTurn({
+              threadId,
+              input: "Control request",
+              modelSelection: selection(WATCHMAN_CONTROL_AGENT),
+            })
+            .pipe(Effect.result),
+          adapter
+            .sendTurn({
+              threadId,
+              input: "Developer request",
+              modelSelection: selection(WATCHMAN_DEVELOPER_AGENT),
+            })
+            .pipe(Effect.result),
+        ],
+        { concurrency: "unbounded" },
+      );
+
+      NodeAssert.equal(results.filter((result) => result._tag === "Success").length, 1);
+      NodeAssert.equal(results.filter((result) => result._tag === "Failure").length, 1);
+      NodeAssert.equal(runtimeMock.state.promptCalls.length, 1);
+    }),
+  );
+
+  it.effect("serializes interrupt with delayed prompt acceptance before switching modes", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-watchman-interrupt-boundary");
+      const selection = (agent: string) =>
+        createModelSelection(ProviderInstanceId.make("opencode"), "cerebras/zai-glm-4.7", [
+          { id: "agent", value: agent },
+        ]);
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+        modelSelection: selection(WATCHMAN_CONTROL_AGENT),
+      });
+
+      let releasePrompt: (() => void) | undefined;
+      runtimeMock.state.promptAsyncGate = new Promise<void>((resolve) => {
+        releasePrompt = resolve;
+      });
+      const controlFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "Control request",
+          modelSelection: selection(WATCHMAN_CONTROL_AGENT),
+        })
+        .pipe(Effect.forkChild);
+      for (
+        let attempt = 0;
+        attempt < 10 && runtimeMock.state.promptCalls.length === 0;
+        attempt += 1
+      ) {
+        yield* Effect.yieldNow;
+      }
+      NodeAssert.equal(runtimeMock.state.promptCalls.length, 1);
+
+      const interruptFiber = yield* adapter.interruptTurn(threadId).pipe(Effect.forkChild);
+      const developerFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "Developer request",
+          modelSelection: selection(WATCHMAN_DEVELOPER_AGENT),
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      NodeAssert.equal(runtimeMock.state.abortCalls.length, 0);
+
+      releasePrompt?.();
+      runtimeMock.state.promptAsyncGate = null;
+      yield* Fiber.join(controlFiber);
+      yield* Fiber.join(interruptFiber);
+      yield* Fiber.join(developerFiber);
+
+      NodeAssert.equal(runtimeMock.state.abortCalls.length, 1);
+      NodeAssert.deepEqual(
+        runtimeMock.state.promptCalls.map((call) => (call as { readonly agent?: string }).agent),
+        [WATCHMAN_CONTROL_AGENT, WATCHMAN_DEVELOPER_AGENT],
+      );
+    }),
+  );
+
+  it.effect("rejects adding a Watchman agent to a stock permissioned session", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-stock-to-watchman");
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const error = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "Operate the site",
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("opencode"),
+            "cerebras/zai-glm-4.7",
+            [{ id: "agent", value: WATCHMAN_CONTROL_AGENT }],
+          ),
+        })
+        .pipe(Effect.flip);
+
+      NodeAssert.equal(error._tag, "ProviderAdapterValidationError");
+      if (error._tag !== "ProviderAdapterValidationError") {
+        throw new Error("Unexpected error type");
+      }
+      NodeAssert.equal(
+        error.issue,
+        "A Watchman agent requires a conversation started with a Watchman agent.",
+      );
+      NodeAssert.deepEqual(runtimeMock.state.promptCalls, []);
     }),
   );
 
@@ -1375,3 +1942,40 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 });
+
+it.layer(WatchmanWorkspaceOpenCodeAdapterTestLayer)(
+  "OpenCodeAdapterLive Watchman workspace boundary",
+  (it) => {
+    it.effect("rejects missing and stock agents before starting a Watchman session", () =>
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+
+        for (const [threadId, modelSelection] of [
+          [
+            asThreadId("thread-watchman-missing-agent"),
+            createModelSelection(ProviderInstanceId.make("opencode"), "xai/grok-4.5"),
+          ],
+          [
+            asThreadId("thread-watchman-stock-agent"),
+            createModelSelection(ProviderInstanceId.make("opencode"), "xai/grok-4.5", [
+              { id: "agent", value: "build" },
+            ]),
+          ],
+        ] as const) {
+          const error = yield* adapter
+            .startSession({
+              provider: ProviderDriverKind.make("opencode"),
+              threadId,
+              runtimeMode: "full-access",
+              modelSelection,
+            })
+            .pipe(Effect.flip);
+
+          NodeAssert.equal(error._tag, "ProviderAdapterValidationError");
+        }
+
+        NodeAssert.deepEqual(runtimeMock.state.sessionCreateInputs, []);
+      }),
+    );
+  },
+);

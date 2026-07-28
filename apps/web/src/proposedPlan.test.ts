@@ -4,6 +4,7 @@ import {
   buildCollapsedProposedPlanPreviewMarkdown,
   buildPlanImplementationThreadTitle,
   buildPlanImplementationPrompt,
+  buildPlanRefinementPrompt,
   buildProposedPlanMarkdownFilename,
   proposedPlanTitle,
   resolvePlanFollowUpSubmission,
@@ -24,6 +25,14 @@ describe("buildPlanImplementationPrompt", () => {
   it("formats the plan exactly like the Codex follow-up handoff prompt", () => {
     expect(buildPlanImplementationPrompt("## Ship it\n\n- step 1\n")).toBe(
       "PLEASE IMPLEMENT THIS PLAN:\n## Ship it\n\n- step 1",
+    );
+  });
+});
+
+describe("buildPlanRefinementPrompt", () => {
+  it("carries the plan artifact when refinement starts with a new provider", () => {
+    expect(buildPlanRefinementPrompt("## Ship it\n\n- step 1\n", "Refine step 1")).toBe(
+      "CURRENT PLAN:\n## Ship it\n\n- step 1\n\nUSER'S REFINEMENT REQUEST:\nRefine step 1",
     );
   });
 });

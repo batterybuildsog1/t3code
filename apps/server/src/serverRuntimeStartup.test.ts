@@ -23,6 +23,39 @@ it("uses the canonical Codex default for auto-bootstrapped model selection", () 
   });
 });
 
+it("uses Watchman Control as the Watchman project default", () => {
+  assert.deepStrictEqual(
+    ServerRuntimeStartup.getAutoBootstrapDefaultModelSelection("/srv/watchman", "/srv/watchman"),
+    {
+      instanceId: ProviderInstanceId.make("opencode"),
+      model: "xai/grok-4.5",
+      options: [{ id: "agent", value: "watchman-control" }],
+    },
+  );
+});
+
+it("compares model selections structurally before updating Watchman project metadata", () => {
+  const left = {
+    instanceId: ProviderInstanceId.make("opencode"),
+    model: "xai/grok-4.5",
+    options: [{ id: "agent", value: "watchman-control" }],
+  };
+  const right = {
+    instanceId: ProviderInstanceId.make("opencode"),
+    model: "xai/grok-4.5",
+    options: [{ id: "agent", value: "watchman-control" }],
+  };
+
+  assert.equal(ServerRuntimeStartup.modelSelectionsEqual(left, right), true);
+  assert.equal(
+    ServerRuntimeStartup.modelSelectionsEqual(left, {
+      ...right,
+      options: [{ id: "agent", value: "watchman-developer" }],
+    }),
+    false,
+  );
+});
+
 it.effect("enqueueCommand waits for readiness and then drains queued work", () =>
   Effect.scoped(
     Effect.gen(function* () {

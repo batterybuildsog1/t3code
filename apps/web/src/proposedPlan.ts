@@ -74,6 +74,10 @@ export function buildPlanImplementationPrompt(planMarkdown: string): string {
   return `PLEASE IMPLEMENT THIS PLAN:\n${planMarkdown.trim()}`;
 }
 
+export function buildPlanRefinementPrompt(planMarkdown: string, refinementRequest: string): string {
+  return `CURRENT PLAN:\n${planMarkdown.trim()}\n\nUSER'S REFINEMENT REQUEST:\n${refinementRequest.trim()}`;
+}
+
 export function resolvePlanFollowUpSubmission(input: { draftText: string; planMarkdown: string }): {
   text: string;
   interactionMode: "default" | "plan";

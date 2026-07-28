@@ -1,0 +1,48 @@
+import { expect, it } from "@effect/vitest";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import { ExitCode } from "effect/unstable/process/ChildProcessSpawner";
+
+import * as ProcessRunner from "../../../processRunner.ts";
+import * as WatchmanHaCli from "./WatchmanHaCli.ts";
+
+it.effect("passes exact REST arguments to the existing watchman-ha helper", () => {
+  const invocations: ProcessRunner.ProcessRunInput[] = [];
+  const RunnerLayer = Layer.succeed(
+    ProcessRunner.ProcessRunner,
+    ProcessRunner.ProcessRunner.of({
+      run: (input) => {
+        invocations.push(input);
+        return Effect.succeed({
+          stdout: '{"ok":true}',
+          stderr: "",
+          code: ExitCode(0),
+          timedOut: false,
+          stdoutTruncated: false,
+          stderrTruncated: false,
+        });
+      },
+    }),
+  );
+
+  return Effect.gen(function* () {
+    const cli = yield* WatchmanHaCli.WatchmanHaCli;
+    expect(
+      yield* cli.rest("POST", "/api/services/input_number/set_value", {
+        entity_id: "input_number.well_user_max_hz",
+        value: 110,
+      }),
+    ).toEqual({ ok: true });
+    expect(invocations).toHaveLength(1);
+    expect(invocations[0]).toMatchObject({
+      command: "watchman-ha",
+      args: [
+        "rest",
+        "POST",
+        "/api/services/input_number/set_value",
+        '{"entity_id":"input_number.well_user_max_hz","value":110}',
+      ],
+      timeout: "30 seconds",
+    });
+  }).pipe(Effect.provide(WatchmanHaCli.layer.pipe(Layer.provide(RunnerLayer))));
+});

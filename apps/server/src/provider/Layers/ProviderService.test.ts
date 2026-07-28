@@ -46,11 +46,16 @@ import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
-import { makeProviderServiceLive } from "./ProviderService.ts";
+import {
+  isWatchmanControlProviderSelectionAllowed,
+  makeProviderServiceLive,
+  shouldGrantWatchmanControlCapability,
+} from "./ProviderService.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as ProviderSessionRuntime from "../../persistence/ProviderSessionRuntime.ts";
+import * as ServerConfig from "../../config.ts";
 import {
   makeSqlitePersistenceLive,
   SqlitePersistenceMemory,
@@ -59,7 +64,13 @@ import * as ServerSettings from "../../serverSettings.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
 
-const defaultServerSettingsLayer = ServerSettings.ServerSettingsService.layerTest();
+const defaultServerConfigLayer = Layer.succeed(ServerConfig.ServerConfig, {
+  cwd: process.cwd(),
+} as never);
+const defaultServerSettingsLayer = Layer.merge(
+  ServerSettings.ServerSettingsService.layerTest(),
+  defaultServerConfigLayer,
+);
 
 const asRequestId = (value: string): ApprovalRequestId => ApprovalRequestId.make(value);
 const asEventId = (value: string): EventId => EventId.make(value);
@@ -70,6 +81,111 @@ const claudeAgentInstanceId = ProviderInstanceId.make("claudeAgent");
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
 const CLAUDE_AGENT_DRIVER = ProviderDriverKind.make("claudeAgent");
 const CURSOR_DRIVER = ProviderDriverKind.make("cursor");
+const OPENCODE_DRIVER = ProviderDriverKind.make("opencode");
+
+it("grants Watchman MCP control only to a Watchman agent in the canonical project", () => {
+  const selection = createModelSelection(
+    ProviderInstanceId.make("opencode"),
+    "cerebras/zai-glm-4.7",
+    [{ id: "agent", value: "watchman-control" }],
+  );
+  assert.equal(
+    shouldGrantWatchmanControlCapability({
+      modelSelection: selection,
+      providerInstanceId: ProviderInstanceId.make("opencode"),
+      provider: OPENCODE_DRIVER,
+      cwd: "/srv/watchman",
+      projectRoot: "/srv/watchman",
+    }),
+    true,
+  );
+  assert.equal(
+    shouldGrantWatchmanControlCapability({
+      modelSelection: selection,
+      providerInstanceId: ProviderInstanceId.make("opencode"),
+      provider: OPENCODE_DRIVER,
+      cwd: "/srv/other",
+      projectRoot: "/srv/watchman",
+    }),
+    false,
+  );
+  assert.equal(
+    shouldGrantWatchmanControlCapability({
+      modelSelection: createModelSelection(
+        ProviderInstanceId.make("opencode"),
+        "cerebras/zai-glm-4.7",
+        [{ id: "agent", value: "watchman-developer" }],
+      ),
+      providerInstanceId: codexInstanceId,
+      provider: CODEX_DRIVER,
+      cwd: "/srv/watchman",
+      projectRoot: "/srv/watchman",
+    }),
+    true,
+  );
+  assert.equal(
+    shouldGrantWatchmanControlCapability({
+      modelSelection: createModelSelection(
+        ProviderInstanceId.make("opencode"),
+        "cerebras/zai-glm-4.7",
+        [{ id: "agent", value: "watchman-developer" }],
+      ),
+      providerInstanceId: codexInstanceId,
+      provider: CODEX_DRIVER,
+      cwd: "/srv/other",
+      projectRoot: "/srv/watchman",
+    }),
+    false,
+  );
+  assert.equal(
+    shouldGrantWatchmanControlCapability({
+      modelSelection: createModelSelection(
+        ProviderInstanceId.make("opencode"),
+        "cerebras/zai-glm-4.7",
+      ),
+      providerInstanceId: ProviderInstanceId.make("opencode"),
+      provider: OPENCODE_DRIVER,
+      cwd: "/srv/watchman",
+      projectRoot: "/srv/watchman",
+    }),
+    false,
+  );
+});
+
+it("rejects Watchman Control on native providers but permits Developer", () => {
+  assert.equal(
+    isWatchmanControlProviderSelectionAllowed({
+      modelSelection: createModelSelection(codexInstanceId, "gpt-5.6-codex", [
+        { id: "agent", value: "watchman-control" },
+      ]),
+      providerInstanceId: codexInstanceId,
+      provider: CODEX_DRIVER,
+    }),
+    false,
+  );
+  assert.equal(
+    isWatchmanControlProviderSelectionAllowed({
+      modelSelection: createModelSelection(codexInstanceId, "gpt-5.6-codex", [
+        { id: "agent", value: "watchman-developer" },
+      ]),
+      providerInstanceId: codexInstanceId,
+      provider: CODEX_DRIVER,
+    }),
+    true,
+  );
+  assert.equal(
+    isWatchmanControlProviderSelectionAllowed({
+      modelSelection: createModelSelection(
+        ProviderInstanceId.make("opencode-remote"),
+        "xai/grok-4.5",
+        [{ id: "agent", value: "watchman-control" }],
+      ),
+      providerInstanceId: ProviderInstanceId.make("opencode-remote"),
+      provider: OPENCODE_DRIVER,
+    }),
+    false,
+  );
+});
 
 type LegacyProviderRuntimeEvent = {
   readonly type: string;
@@ -271,10 +387,12 @@ function makeProviderServiceLayer() {
   const codex = makeFakeCodexAdapter();
   const claude = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER);
   const cursor = makeFakeCodexAdapter(CURSOR_DRIVER);
+  const opencode = makeFakeCodexAdapter(OPENCODE_DRIVER);
   const registry = makeAdapterRegistryMock({
     [ProviderDriverKind.make("codex")]: codex.adapter,
     [ProviderDriverKind.make("claudeAgent")]: claude.adapter,
     [ProviderDriverKind.make("cursor")]: cursor.adapter,
+    [ProviderDriverKind.make("opencode")]: opencode.adapter,
   });
 
   const providerAdapterLayer = Layer.succeed(
@@ -311,6 +429,7 @@ function makeProviderServiceLayer() {
     codex,
     claude,
     cursor,
+    opencode,
     layer,
   };
 }
@@ -485,6 +604,7 @@ it.effect(
       const providerLayer = makeProviderServiceLive().pipe(
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
+        Layer.provide(defaultServerConfigLayer),
         Layer.provide(serverSettingsLayer),
         Layer.provide(AnalyticsService.layerTest),
         Layer.provide(
@@ -841,6 +961,40 @@ it.effect(
 );
 
 routing.layer("ProviderServiceLive routing", (it) => {
+  it.effect("requires a new conversation between stock and Watchman OpenCode profiles", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-stock-watchman-boundary");
+      yield* provider.startSession(threadId, {
+        provider: OPENCODE_DRIVER,
+        providerInstanceId: ProviderInstanceId.make("opencode"),
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: createModelSelection(ProviderInstanceId.make("opencode"), "xai/grok-4.5"),
+      });
+      routing.opencode.sendTurn.mockClear();
+
+      const failure = yield* provider
+        .sendTurn({
+          threadId,
+          input: "Operate the site",
+          attachments: [],
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("opencode"),
+            "xai/grok-4.5",
+            [{ id: "agent", value: "watchman-control" }],
+          ),
+        })
+        .pipe(Effect.flip);
+
+      assert.instanceOf(failure, ProviderValidationError);
+      assert.include(failure.issue, "requires a new conversation");
+      assert.equal(routing.opencode.sendTurn.mock.calls.length, 0);
+      yield* provider.stopSession({ threadId });
+    }),
+  );
+
   it.effect("routes provider operations and rollback conversation", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;

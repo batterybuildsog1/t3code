@@ -7,6 +7,7 @@ import {
   ProviderInstanceId,
   ThreadId,
 } from "@t3tools/contracts";
+import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import * as Console from "effect/Console";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -40,6 +41,9 @@ import {
   isWildcardHost,
   issueHeadlessServeAccessInfo,
 } from "./startupAccess.ts";
+import { isWatchmanWorkspaceRoot } from "./watchmanWorkspace.ts";
+
+export { isWatchmanWorkspaceRoot } from "./watchmanWorkspace.ts";
 
 export class ServerRuntimeStartupError extends Schema.TaggedErrorClass<ServerRuntimeStartupError>()(
   "ServerRuntimeStartupError",
@@ -161,10 +165,39 @@ export const launchStartupHeartbeat = recordStartupHeartbeat.pipe(
   Effect.asVoid,
 );
 
-export const getAutoBootstrapDefaultModelSelection = (): ModelSelection => ({
-  instanceId: ProviderInstanceId.make("codex"),
-  model: DEFAULT_MODEL,
-});
+export function getAutoBootstrapDefaultModelSelection(
+  workspaceRoot?: string,
+  watchmanProjectRoot?: string,
+): ModelSelection {
+  return isWatchmanWorkspaceRoot(workspaceRoot, watchmanProjectRoot)
+    ? {
+        instanceId: ProviderInstanceId.make("opencode"),
+        model: "xai/grok-4.5",
+        options: [{ id: "agent", value: "watchman-control" }],
+      }
+    : {
+        instanceId: ProviderInstanceId.make("codex"),
+        model: DEFAULT_MODEL,
+      };
+}
+
+export function modelSelectionsEqual(
+  left: ModelSelection | null | undefined,
+  right: ModelSelection | null | undefined,
+): boolean {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  if (left.instanceId !== right.instanceId || left.model !== right.model) return false;
+  const leftOptions = left.options ?? [];
+  const rightOptions = right.options ?? [];
+  return (
+    leftOptions.length === rightOptions.length &&
+    leftOptions.every(
+      (option, index) =>
+        option.id === rightOptions[index]?.id && option.value === rightOptions[index]?.value,
+    )
+  );
+}
 
 export const resolveWelcomeBase = Effect.gen(function* () {
   const serverConfig = yield* ServerConfig.ServerConfig;
@@ -193,6 +226,8 @@ export const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
       const existingProject = yield* projectionReadModelQuery.getActiveProjectByWorkspaceRoot(
         serverConfig.cwd,
       );
+      const isWatchmanProject = isWatchmanWorkspaceRoot(serverConfig.cwd);
+      const autoDefaultModelSelection = getAutoBootstrapDefaultModelSelection(serverConfig.cwd);
       let nextProjectId: ProjectId;
       let nextProjectDefaultModelSelection: ModelSelection;
 
@@ -200,7 +235,7 @@ export const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
         const createdAt = DateTime.formatIso(yield* DateTime.now);
         nextProjectId = ProjectId.make(yield* randomUUID);
         const bootstrapProjectTitle = path.basename(serverConfig.cwd) || "project";
-        nextProjectDefaultModelSelection = getAutoBootstrapDefaultModelSelection();
+        nextProjectDefaultModelSelection = autoDefaultModelSelection;
         yield* orchestrationEngine.dispatch({
           type: "project.create",
           commandId: CommandId.make(yield* randomUUID),
@@ -212,12 +247,58 @@ export const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
         });
       } else {
         nextProjectId = existingProject.value.id;
-        nextProjectDefaultModelSelection =
-          existingProject.value.defaultModelSelection ?? getAutoBootstrapDefaultModelSelection();
+        nextProjectDefaultModelSelection = isWatchmanProject
+          ? autoDefaultModelSelection
+          : (existingProject.value.defaultModelSelection ?? autoDefaultModelSelection);
+        if (
+          isWatchmanProject &&
+          !modelSelectionsEqual(
+            existingProject.value.defaultModelSelection,
+            nextProjectDefaultModelSelection,
+          )
+        ) {
+          yield* orchestrationEngine.dispatch({
+            type: "project.meta.update",
+            commandId: CommandId.make(yield* randomUUID),
+            projectId: nextProjectId,
+            defaultModelSelection: nextProjectDefaultModelSelection,
+          });
+        }
       }
 
-      const existingThreadId =
+      let existingThreadId =
         yield* projectionReadModelQuery.getFirstActiveThreadIdByProjectId(nextProjectId);
+      if (isWatchmanProject) {
+        const snapshot = yield* projectionReadModelQuery.getShellSnapshot();
+        const projectThreads = snapshot.threads.filter(
+          (thread) => thread.projectId === nextProjectId && thread.archivedAt === null,
+        );
+        const watchmanThread = projectThreads.find((thread) => {
+          const agent = getModelSelectionStringOptionValue(thread.modelSelection, "agent");
+          return agent === "watchman-control" || agent === "watchman-developer";
+        });
+        if (watchmanThread) {
+          existingThreadId = Option.some(watchmanThread.id);
+        } else {
+          const blankThread = projectThreads.find(
+            (thread) =>
+              thread.latestTurn === null &&
+              thread.session === null &&
+              thread.latestUserMessageAt === null,
+          );
+          if (blankThread) {
+            yield* orchestrationEngine.dispatch({
+              type: "thread.meta.update",
+              commandId: CommandId.make(yield* randomUUID),
+              threadId: blankThread.id,
+              modelSelection: nextProjectDefaultModelSelection,
+            });
+            existingThreadId = Option.some(blankThread.id);
+          } else {
+            existingThreadId = Option.none();
+          }
+        }
+      }
       if (Option.isNone(existingThreadId)) {
         const createdAt = DateTime.formatIso(yield* DateTime.now);
         const createdThreadId = ThreadId.make(yield* randomUUID);

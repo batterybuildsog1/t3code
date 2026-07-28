@@ -16,6 +16,7 @@ import { Argument, Flag } from "effect/unstable/cli";
 import { readBootstrapEnvelope } from "../bootstrap.ts";
 import * as ServerConfig from "../config.ts";
 import { expandHomePath, resolveBaseDir } from "../os-jank.ts";
+import { resolveWatchmanProjectRoot } from "../watchmanWorkspace.ts";
 
 export const modeFlag = Flag.choice("mode", ServerConfig.RuntimeMode.literals).pipe(
   Flag.withDescription("Runtime mode. `desktop` keeps loopback defaults unless overridden."),
@@ -192,6 +193,14 @@ export const sharedServerCommandFlags = {
 
 export const authLocationFlags = sharedServerLocationFlags;
 
+export function resolveServerWorkingDirectory(
+  explicitCwd: string | undefined,
+  watchmanProjectRoot: string | undefined,
+  processCwd: string,
+): string {
+  return explicitCwd ?? watchmanProjectRoot ?? processCwd;
+}
+
 const resolveOptionPrecedence = <Value>(
   ...values: ReadonlyArray<Option.Option<Value>>
 ): Option.Option<Value> => Option.firstSomeOf(values);
@@ -279,7 +288,11 @@ export const resolveServerConfig = (
         resolveOptionPrecedence(explicitBaseDir, Option.fromUndefinedOr(bootstrap?.t3Home)),
       ),
     );
-    const rawCwd = Option.getOrElse(normalizedFlags.cwd, () => process.cwd());
+    const rawCwd = resolveServerWorkingDirectory(
+      Option.getOrUndefined(normalizedFlags.cwd),
+      resolveWatchmanProjectRoot(),
+      process.cwd(),
+    );
     const cwd = path.resolve(yield* expandHomePath(rawCwd.trim()));
     yield* fs.makeDirectory(cwd, { recursive: true });
     const derivedPaths = yield* ServerConfig.deriveServerPaths(baseDir, devUrl, {

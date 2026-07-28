@@ -31,6 +31,7 @@ import { useComposerDraftStore, DraftId } from "../../composerDraftStore";
 import { getProviderModelCapabilities } from "../../providerModels";
 import { cn } from "~/lib/utils";
 import { Badge } from "../ui/badge";
+import { ensureWatchmanDeveloperModeUnlocked } from "../../watchmanDeveloperMode";
 
 type ProviderOptions = ReadonlyArray<ProviderOptionSelection>;
 
@@ -275,6 +276,9 @@ export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
     value: string,
   ) => {
     if (!value) return;
+    if (descriptor.id === "agent" && !ensureWatchmanDeveloperModeUnlocked(value)) {
+      return;
+    }
     if (descriptor.promptInjectedValues?.includes(value)) {
       const nextPrompt =
         prompt.trim().length === 0

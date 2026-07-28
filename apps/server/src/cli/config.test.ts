@@ -16,7 +16,7 @@ import {
 import * as NetService from "@t3tools/shared/Net";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { deriveServerPaths } from "../config.ts";
-import { resolveServerConfig } from "./config.ts";
+import { resolveServerConfig, resolveServerWorkingDirectory } from "./config.ts";
 
 const deriveExplicitServerPaths = (baseDir: string, devUrl: URL | undefined) =>
   deriveServerPaths(baseDir, devUrl, { baseDirIsExplicit: true });
@@ -35,6 +35,15 @@ const makeDesktopBootstrap = (
   tailscaleServeEnabled: false,
   tailscaleServePort: 443,
   ...overrides,
+});
+
+it("uses the Watchman project root as the server cwd unless the CLI overrides it", () => {
+  expect(resolveServerWorkingDirectory(undefined, "/srv/watchman", "/srv/t3")).toBe(
+    "/srv/watchman",
+  );
+  expect(resolveServerWorkingDirectory("/srv/explicit", "/srv/watchman", "/srv/t3")).toBe(
+    "/srv/explicit",
+  );
 });
 
 it.layer(NodeServices.layer)("cli config resolution", (it) => {

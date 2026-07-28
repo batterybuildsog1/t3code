@@ -15,6 +15,7 @@ import type { ReactNode } from "react";
 
 import type { DraftId } from "../../composerDraftStore";
 import { getProviderModelCapabilities } from "../../providerModels";
+import { WATCHMAN_CONTROL_AGENT, WATCHMAN_DEVELOPER_AGENT } from "../../watchmanDeveloperMode";
 import { shouldRenderTraitsControls, TraitsMenuContent, TraitsPicker } from "./TraitsPicker";
 
 export type ComposerProviderStateInput = {
@@ -65,11 +66,21 @@ export function getComposerProviderState(input: ComposerProviderStateInput): Com
   const ultrathinkActive =
     (primarySelectDescriptor?.promptInjectedValues?.length ?? 0) > 0 &&
     promptInjectionState === "ultrathink";
+  const descriptorOptions = buildProviderOptionSelectionsFromDescriptors(descriptors);
+  const watchmanAgent = modelOptions?.find(
+    (option) =>
+      option.id === "agent" &&
+      (option.value === WATCHMAN_CONTROL_AGENT || option.value === WATCHMAN_DEVELOPER_AGENT),
+  );
+  const modelOptionsForDispatch =
+    watchmanAgent && !descriptorOptions?.some((option) => option.id === "agent")
+      ? [...(descriptorOptions ?? []), watchmanAgent]
+      : descriptorOptions;
 
   return {
     provider,
     promptEffort,
-    modelOptionsForDispatch: buildProviderOptionSelectionsFromDescriptors(descriptors),
+    modelOptionsForDispatch,
     ...(ultrathinkActive
       ? {
           composerFrameClassName: "ultrathink-frame",

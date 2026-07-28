@@ -99,6 +99,7 @@ import { useUiStateStore } from "../uiStateStore";
 import {
   buildPlanImplementationThreadTitle,
   buildPlanImplementationPrompt,
+  buildPlanRefinementPrompt,
   resolvePlanFollowUpSubmission,
 } from "../proposedPlan";
 import {
@@ -249,6 +250,7 @@ import {
 import {
   MAX_HIDDEN_MOUNTED_TERMINAL_THREADS,
   branchMismatchKey,
+  buildNextComposerModelSelection,
   buildExpiredTerminalContextToastCopy,
   buildLocalDraftThread,
   buildThreadTurnInterruptInput,
@@ -259,20 +261,20 @@ import {
   hasServerAcknowledgedLocalDispatch,
   isBranchMismatchDismissedForSession,
   shouldShowBranchMismatchBanner,
-  getStartedThreadModelChangeBlockReason,
   LAST_INVOKED_SCRIPT_BY_PROJECT_KEY,
   LastInvokedScriptByProjectSchema,
   type LocalDispatchSnapshot,
   PullRequestDialogState,
   cloneComposerImageForRetry,
-  deriveLockedProvider,
   readFileAsDataUrl,
   reconcileMountedTerminalThreadIds,
   resolveThreadMetadataUpdateForNextTurn,
   resolveSendEnvMode,
   revokeBlobPreviewUrl,
   revokeUserMessagePreviewUrls,
+  shouldStartNewConversationForModelSelection,
   startNewThreadForProject,
+  threadHasStarted,
   waitForStartedServerThread,
 } from "./ChatView.logic";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
@@ -302,6 +304,12 @@ import {
   serverUpdateGuidance,
 } from "../versionSkew";
 import { useAssetUrls } from "../assets/assetUrls";
+import {
+  ensureWatchmanDeveloperSelectionUnlocked,
+  selectedWatchmanAgent,
+  WATCHMAN_CONTROL_AGENT,
+  WATCHMAN_CONTROL_PROVIDER_INSTANCE_ID,
+} from "../watchmanDeveloperMode";
 
 const IMAGE_ONLY_BOOTSTRAP_PROMPT =
   "[User attached one or more images without additional text. Respond using the conversation context and the attached image(s).]";
@@ -1831,11 +1839,6 @@ function ChatViewContent(props: ChatViewProps) {
     activeThread?.modelSelection.instanceId ??
     activeProject?.defaultModelSelection?.instanceId ??
     null;
-  const lockedProvider = deriveLockedProvider({
-    thread: activeThread,
-    selectedProvider: selectedProviderByThreadId,
-    threadProvider,
-  });
   // Once a thread selects an environment, never substitute the primary
   // environment's config while the selected environment is still loading.
   const serverConfig = activeThread
@@ -1954,7 +1957,7 @@ function ChatViewContent(props: ChatViewProps) {
     providerStatuses,
     selectedProviderByThreadId ?? threadProvider,
   );
-  const selectedProvider: ProviderDriverKind = lockedProvider ?? unlockedSelectedProvider;
+  const selectedProvider: ProviderDriverKind = unlockedSelectedProvider;
   const phase = derivePhase(activeThread?.session ?? null);
   const threadActivities = activeThread?.activities ?? EMPTY_ACTIVITIES;
   const workLogEntries = useMemo(() => deriveWorkLogEntries(threadActivities), [threadActivities]);
@@ -4493,6 +4496,10 @@ function ChatViewContent(props: ChatViewProps) {
       selectedPromptEffort: ctxSelectedPromptEffort,
       selectedModelSelection: ctxSelectedModelSelection,
     } = sendCtx;
+    if (!ensureWatchmanDeveloperSelectionUnlocked(ctxSelectedModelSelection)) {
+      scheduleComposerFocus();
+      return;
+    }
     const promptForSend = promptRef.current;
     const {
       trimmedPrompt: trimmed,
@@ -4513,11 +4520,9 @@ function ChatViewContent(props: ChatViewProps) {
         draftText: trimmed,
         planMarkdown: activeProposedPlan.planMarkdown,
       });
-      promptRef.current = "";
-      clearComposerDraftContent(composerDraftTarget);
-      composerRef.current?.resetCursorState();
       await onSubmitPlanFollowUp({
         text: followUp.text,
+        restoreText: trimmed,
         interactionMode: followUp.interactionMode,
       });
       return;
@@ -4563,8 +4568,18 @@ function ChatViewContent(props: ChatViewProps) {
       );
       return;
     }
-    const threadIdForSend = activeThread.id;
-    const isFirstMessage = !isServerThread || activeThread.messages.length === 0;
+    const startsNewConversation =
+      isServerThread &&
+      shouldStartNewConversationForModelSelection({
+        providers: providerStatuses,
+        hasStartedSession: threadHasStarted(activeThread),
+        currentModelSelection: activeThread.modelSelection,
+        currentProviderInstanceId: activeThread.session?.providerInstanceId ?? null,
+        nextModelSelection: ctxSelectedModelSelection,
+      });
+    const threadIdForSend = startsNewConversation ? newThreadId() : activeThread.id;
+    const isFirstMessage =
+      startsNewConversation || !isServerThread || activeThread.messages.length === 0;
     const baseBranchForWorktree =
       isFirstMessage && sendEnvMode === "worktree" && !activeThread.worktreePath
         ? activeThreadBranch
@@ -4713,7 +4728,7 @@ function ChatViewContent(props: ChatViewProps) {
 
     let failure: AtomCommandResult<unknown, unknown> | null = null;
     // Auto-title from first message
-    if (isFirstMessage && isServerThread) {
+    if (isFirstMessage && isServerThread && !startsNewConversation) {
       const titleResult = await updateThreadMetadata({
         environmentId,
         input: {
@@ -4726,7 +4741,7 @@ function ChatViewContent(props: ChatViewProps) {
       }
     }
 
-    if (failure === null && isServerThread) {
+    if (failure === null && isServerThread && !startsNewConversation) {
       const settingsResult = await persistThreadSettingsForNextTurn({
         threadId: threadIdForSend,
         createdAt: messageCreatedAt,
@@ -4750,9 +4765,9 @@ function ChatViewContent(props: ChatViewProps) {
     let turnStartSucceeded = false;
     if (failure === null && turnAttachmentsResult._tag === "Success") {
       const bootstrap =
-        isLocalDraftThread || baseBranchForWorktree
+        isLocalDraftThread || startsNewConversation || baseBranchForWorktree
           ? {
-              ...(isLocalDraftThread
+              ...(isLocalDraftThread || startsNewConversation
                 ? {
                     createThread: {
                       projectId: activeProject.id,
@@ -4762,7 +4777,7 @@ function ChatViewContent(props: ChatViewProps) {
                       interactionMode,
                       branch: activeThreadBranch,
                       worktreePath: activeThread.worktreePath,
-                      createdAt: activeThread.createdAt,
+                      createdAt: startsNewConversation ? messageCreatedAt : activeThread.createdAt,
                     },
                   }
                 : {}),
@@ -4802,6 +4817,34 @@ function ChatViewContent(props: ChatViewProps) {
         failure = startResult;
       } else {
         turnStartSucceeded = true;
+        if (startsNewConversation) {
+          setComposerDraftModelSelection(
+            scopeThreadRef(activeThread.environmentId, activeThread.id),
+            activeThread.modelSelection,
+            { replaceOptions: true },
+          );
+          await waitForStartedServerThread(
+            scopeThreadRef(activeThread.environmentId, threadIdForSend),
+          );
+          const navigationResult = await settlePromise(() =>
+            navigate({
+              to: "/$environmentId/$threadId",
+              params: {
+                environmentId: activeThread.environmentId,
+                threadId: threadIdForSend,
+              },
+            }),
+          );
+          if (navigationResult._tag === "Failure") {
+            toastManager.add(
+              stackedThreadToast({
+                type: "warning",
+                title: "New conversation started",
+                description: "Open it from history to continue with the selected provider.",
+              }),
+            );
+          }
+        }
       }
     }
 
@@ -4844,7 +4887,7 @@ function ChatViewContent(props: ChatViewProps) {
       if (!isAtomCommandInterrupted(failure)) {
         const error = squashAtomCommandFailure(failure);
         setThreadError(
-          threadIdForSend,
+          startsNewConversation ? activeThread.id : threadIdForSend,
           error instanceof Error ? error.message : "Failed to send message.",
         );
       }
@@ -5038,13 +5081,16 @@ function ChatViewContent(props: ChatViewProps) {
   const onSubmitPlanFollowUp = useCallback(
     async ({
       text,
+      restoreText,
       interactionMode: nextInteractionMode,
     }: {
       text: string;
+      restoreText: string;
       interactionMode: "default" | "plan";
     }) => {
       if (
         !activeThread ||
+        !activeProject ||
         !isServerThread ||
         isSendBusy ||
         isConnecting ||
@@ -5069,21 +5115,39 @@ function ChatViewContent(props: ChatViewProps) {
         selectedPromptEffort: ctxSelectedPromptEffort,
         selectedModelSelection: ctxSelectedModelSelection,
       } = sendCtx;
+      if (!ensureWatchmanDeveloperSelectionUnlocked(ctxSelectedModelSelection)) {
+        scheduleComposerFocus();
+        return;
+      }
 
-      const threadIdForSend = activeThread.id;
+      const startsNewConversation = shouldStartNewConversationForModelSelection({
+        providers: providerStatuses,
+        hasStartedSession: threadHasStarted(activeThread),
+        currentModelSelection: activeThread.modelSelection,
+        currentProviderInstanceId: activeThread.session?.providerInstanceId ?? null,
+        nextModelSelection: ctxSelectedModelSelection,
+      });
+      const threadIdForSend = startsNewConversation ? newThreadId() : activeThread.id;
       const messageIdForSend = newMessageId();
       const messageCreatedAt = new Date().toISOString();
+      const messageTextForSend =
+        startsNewConversation && nextInteractionMode === "plan" && activeProposedPlan
+          ? buildPlanRefinementPrompt(activeProposedPlan.planMarkdown, trimmed)
+          : trimmed;
       const outgoingMessageText = formatOutgoingPrompt({
         provider: ctxSelectedProvider,
         model: ctxSelectedModel,
         models: ctxSelectedProviderModels,
         effort: ctxSelectedPromptEffort,
-        text: trimmed,
+        text: messageTextForSend,
       });
 
       sendInFlightRef.current = true;
+      promptRef.current = "";
+      clearComposerDraftContent(composerDraftTarget);
+      composerRef.current?.resetCursorState();
       beginLocalDispatch({ preparingWorktree: false });
-      setThreadError(threadIdForSend, null);
+      setThreadError(startsNewConversation ? activeThread.id : threadIdForSend, null);
 
       // Position this sent row once LegendList has measured the anchored tail.
       isAtEndRef.current = true;
@@ -5111,18 +5175,20 @@ function ChatViewContent(props: ChatViewProps) {
         },
       ]);
 
-      const settingsResult = await persistThreadSettingsForNextTurn({
-        threadId: threadIdForSend,
-        createdAt: messageCreatedAt,
-        modelSelection: ctxSelectedModelSelection,
-        ...(localCheckoutBranchMismatch
-          ? { branch: localCheckoutBranchMismatch.currentBranch }
-          : {}),
-        runtimeMode,
-        interactionMode: nextInteractionMode,
-      });
-      let failure: AtomCommandResult<unknown, unknown> | null =
-        settingsResult._tag === "Failure" ? settingsResult : null;
+      let failure: AtomCommandResult<unknown, unknown> | null = null;
+      if (!startsNewConversation) {
+        const settingsResult = await persistThreadSettingsForNextTurn({
+          threadId: threadIdForSend,
+          createdAt: messageCreatedAt,
+          modelSelection: ctxSelectedModelSelection,
+          ...(localCheckoutBranchMismatch
+            ? { branch: localCheckoutBranchMismatch.currentBranch }
+            : {}),
+          runtimeMode,
+          interactionMode: nextInteractionMode,
+        });
+        failure = settingsResult._tag === "Failure" ? settingsResult : null;
+      }
 
       if (failure === null) {
         // Keep the mode toggle and plan-follow-up banner in sync immediately
@@ -5146,6 +5212,22 @@ function ChatViewContent(props: ChatViewProps) {
             titleSeed: activeThread.title,
             runtimeMode,
             interactionMode: nextInteractionMode,
+            ...(startsNewConversation
+              ? {
+                  bootstrap: {
+                    createThread: {
+                      projectId: activeProject.id,
+                      title: truncate(trimmed),
+                      modelSelection: ctxSelectedModelSelection,
+                      runtimeMode,
+                      interactionMode: nextInteractionMode,
+                      branch: activeThreadBranch,
+                      worktreePath: activeThread.worktreePath,
+                      createdAt: messageCreatedAt,
+                    },
+                  },
+                }
+              : {}),
             ...(nextInteractionMode === "default" && activeProposedPlan
               ? {
                   sourceProposedPlan: {
@@ -5161,6 +5243,38 @@ function ChatViewContent(props: ChatViewProps) {
       }
 
       if (failure === null) {
+        if (startsNewConversation) {
+          setComposerDraftModelSelection(
+            scopeThreadRef(activeThread.environmentId, activeThread.id),
+            activeThread.modelSelection,
+            { replaceOptions: true },
+          );
+          planSidebarOpenOnNextThreadRef.current =
+            nextInteractionMode === "default" && autoOpenPlanSidebar;
+          await waitForStartedServerThread(
+            scopeThreadRef(activeThread.environmentId, threadIdForSend),
+          );
+          const navigationResult = await settlePromise(() =>
+            navigate({
+              to: "/$environmentId/$threadId",
+              params: {
+                environmentId: activeThread.environmentId,
+                threadId: threadIdForSend,
+              },
+            }),
+          );
+          if (navigationResult._tag === "Failure") {
+            toastManager.add(
+              stackedThreadToast({
+                type: "warning",
+                title: "New conversation started",
+                description: "Open it from history to continue with the selected provider.",
+              }),
+            );
+          }
+          sendInFlightRef.current = false;
+          return;
+        }
         // Optimistically open the plan sidebar when implementing (not refining).
         // "default" mode here means the agent is executing the plan, which produces
         // step-tracking activities that the sidebar will display.
@@ -5177,10 +5291,19 @@ function ChatViewContent(props: ChatViewProps) {
       setOptimisticUserMessages((existing) =>
         existing.filter((message) => message.id !== messageIdForSend),
       );
+      if (restoreText && promptRef.current.length === 0) {
+        promptRef.current = restoreText;
+        setComposerDraftPrompt(composerDraftTarget, restoreText);
+        composerRef.current?.resetCursorState({
+          cursor: collapseExpandedComposerCursor(restoreText, restoreText.length),
+          prompt: restoreText,
+          detectTrigger: true,
+        });
+      }
       if (!isAtomCommandInterrupted(failure)) {
         const error = squashAtomCommandFailure(failure);
         setThreadError(
-          threadIdForSend,
+          startsNewConversation ? activeThread.id : threadIdForSend,
           error instanceof Error ? error.message : "Failed to send plan follow-up.",
         );
       }
@@ -5188,9 +5311,13 @@ function ChatViewContent(props: ChatViewProps) {
       resetLocalDispatch();
     },
     [
+      activeProject,
       activeThread,
+      activeThreadBranch,
       activeProposedPlan,
       beginLocalDispatch,
+      clearComposerDraftContent,
+      composerDraftTarget,
       isConnecting,
       isSendBusy,
       isServerThread,
@@ -5198,7 +5325,12 @@ function ChatViewContent(props: ChatViewProps) {
       persistThreadSettingsForNextTurn,
       resetLocalDispatch,
       runtimeMode,
+      navigate,
+      providerStatuses,
+      scheduleComposerFocus,
       setComposerDraftInteractionMode,
+      setComposerDraftModelSelection,
+      setComposerDraftPrompt,
       setThreadError,
       startThreadTurn,
       autoOpenPlanSidebar,
@@ -5232,6 +5364,10 @@ function ChatViewContent(props: ChatViewProps) {
       selectedPromptEffort: ctxSelectedPromptEffort,
       selectedModelSelection: ctxSelectedModelSelection,
     } = sendCtx;
+    if (!ensureWatchmanDeveloperSelectionUnlocked(ctxSelectedModelSelection)) {
+      scheduleComposerFocus();
+      return;
+    }
 
     const createdAt = new Date().toISOString();
     const nextThreadId = newThreadId();
@@ -5361,6 +5497,7 @@ function ChatViewContent(props: ChatViewProps) {
     navigate,
     resetLocalDispatch,
     runtimeMode,
+    scheduleComposerFocus,
     startThreadTurn,
     autoOpenPlanSidebar,
     environmentId,
@@ -5368,20 +5505,21 @@ function ChatViewContent(props: ChatViewProps) {
   ]);
 
   const getModelDisabledReason = useCallback(
-    (instanceId: ProviderInstanceId, model: string): string | null => {
-      if (!activeThread) {
+    (instanceId: ProviderInstanceId): string | null => {
+      const currentModelSelection = composerRef.current?.getSendContext()?.selectedModelSelection;
+      if (
+        (currentModelSelection ? selectedWatchmanAgent(currentModelSelection) : undefined) !==
+        WATCHMAN_CONTROL_AGENT
+      ) {
         return null;
       }
-      const reason = getStartedThreadModelChangeBlockReason({
-        providers: providerStatuses,
-        hasStartedSession: activeThread.session !== null,
-        currentModelSelection: activeThread.modelSelection,
-        currentProviderInstanceId: activeThread.session?.providerInstanceId ?? null,
-        nextModelSelection: { instanceId, model },
-      });
-      return reason ? `${reason.description} Start a new thread to use this model.` : null;
+      const target = providerStatuses.find((provider) => provider.instanceId === instanceId);
+      return target &&
+        (target.driver !== "opencode" || instanceId !== WATCHMAN_CONTROL_PROVIDER_INSTANCE_ID)
+        ? "Switch this conversation to Watchman Developer before using another provider."
+        : null;
     },
-    [activeThread, providerStatuses],
+    [composerRef, providerStatuses],
   );
 
   const onProviderModelSelect = useCallback(
@@ -5391,27 +5529,17 @@ function ChatViewContent(props: ChatViewProps) {
       // model lookup stay scoped to that exact instance. Unknown instance ids
       // are rejected by returning early; the server remains authoritative too.
       const entry = providerStatuses.find((snapshot) => snapshot.instanceId === instanceId);
-      const resolvedDriverKind = entry?.driver ?? null;
+      if (!entry) return;
+      const currentModelSelection =
+        composerRef.current?.getSendContext()?.selectedModelSelection ??
+        activeThread.modelSelection;
+      const currentAgent = selectedWatchmanAgent(currentModelSelection);
       if (
-        lockedProvider !== null &&
-        resolvedDriverKind !== null &&
-        resolvedDriverKind !== lockedProvider
+        currentAgent === WATCHMAN_CONTROL_AGENT &&
+        (entry.driver !== "opencode" || instanceId !== WATCHMAN_CONTROL_PROVIDER_INSTANCE_ID)
       ) {
         scheduleComposerFocus();
         return;
-      }
-      if (lockedProvider !== null && activeThread.session?.providerInstanceId) {
-        const currentEntry = providerStatuses.find(
-          (snapshot) => snapshot.instanceId === activeThread.session?.providerInstanceId,
-        );
-        if (
-          currentEntry?.continuation?.groupKey &&
-          entry?.continuation?.groupKey &&
-          currentEntry.continuation.groupKey !== entry.continuation.groupKey
-        ) {
-          scheduleComposerFocus();
-          return;
-        }
       }
       const resolvedModel = resolveAppModelSelectionForInstance(
         instanceId,
@@ -5423,26 +5551,11 @@ function ChatViewContent(props: ChatViewProps) {
         scheduleComposerFocus();
         return;
       }
-      const nextModelSelection: ModelSelection = {
-        instanceId,
-        model: resolvedModel,
-      };
-      const modelChangeBlockReason = getStartedThreadModelChangeBlockReason({
-        providers: providerStatuses,
-        hasStartedSession: activeThread.session !== null,
-        currentModelSelection: activeThread.modelSelection,
-        currentProviderInstanceId: activeThread.session?.providerInstanceId ?? null,
-        nextModelSelection,
+      const nextModelSelection = buildNextComposerModelSelection({
+        current: currentModelSelection,
+        nextInstanceId: instanceId,
+        nextModel: resolvedModel,
       });
-      if (modelChangeBlockReason) {
-        toastManager.add({
-          type: "warning",
-          title: modelChangeBlockReason.title,
-          description: modelChangeBlockReason.description,
-        });
-        scheduleComposerFocus();
-        return;
-      }
       setComposerDraftModelSelection(
         scopeThreadRef(activeThread.environmentId, activeThread.id),
         nextModelSelection,
@@ -5452,12 +5565,12 @@ function ChatViewContent(props: ChatViewProps) {
     },
     [
       activeThread,
-      lockedProvider,
       scheduleComposerFocus,
       setComposerDraftModelSelection,
       setStickyComposerModelSelection,
       providerStatuses,
       settings,
+      composerRef,
     ],
   );
   const onEnvModeChange = useCallback(
@@ -5850,7 +5963,7 @@ function ChatViewContent(props: ChatViewProps) {
                             planSidebarOpen={planSidebarOpen}
                             runtimeMode={runtimeMode}
                             interactionMode={interactionMode}
-                            lockedProvider={lockedProvider}
+                            lockedProvider={null}
                             providerStatuses={providerStatuses as ServerProvider[]}
                             activeProjectDefaultModelSelection={
                               activeProject?.defaultModelSelection

@@ -25,6 +25,7 @@ import { resolveNewDraftStartFromOrigin } from "../lib/chatThreadActions";
 import { primaryServerSettingsAtom } from "../state/server";
 import { resolveThreadRouteTarget } from "../threadRoutes";
 import { legacyProjectCwdPreferenceKey, useUiStateStore } from "../uiStateStore";
+import { resolveWatchmanNewConversationModelSelection } from "../watchmanDeveloperMode";
 import { useClientSettings } from "./useSettings";
 
 export function useNewThreadHandler() {
@@ -105,6 +106,10 @@ export function useNewThreadHandler() {
           candidate.id === projectRef.projectId &&
           candidate.environmentId === projectRef.environmentId,
       );
+      const nextModelSelection = resolveWatchmanNewConversationModelSelection({
+        projectDefault: project?.defaultModelSelection,
+        carried: carryModelSelection,
+      });
       const logicalProjectKey = project
         ? deriveLogicalProjectKeyFromSettings(project, projectGroupingSettings)
         : scopedProjectKey(projectRef);
@@ -171,11 +176,11 @@ export function useNewThreadHandler() {
               ...(carryRuntimeMode ? { runtimeMode: carryRuntimeMode } : {}),
               ...(carryInteractionMode ? { interactionMode: carryInteractionMode } : {}),
             });
-            if (carryModelSelection) {
+            if (nextModelSelection) {
               // The carried selection is a complete snapshot of the viewed
               // thread's model state: absent options mean "no options", not
               // "keep the stale draft's options".
-              setModelSelection(reusableStoredDraftThread.draftId, carryModelSelection, {
+              setModelSelection(reusableStoredDraftThread.draftId, nextModelSelection, {
                 replaceOptions: true,
               });
             }
@@ -263,13 +268,13 @@ export function useNewThreadHandler() {
           ...(carryInteractionMode ? { interactionMode: carryInteractionMode } : {}),
         });
         applyStickyState(draftId);
-        if (carryModelSelection) {
+        if (nextModelSelection) {
           // After sticky state so the viewed thread's exact selection
           // (model + options like effort and context window) wins over the
           // globally sticky one. replaceOptions: the carried selection is a
           // complete snapshot — absent options mean "no options", not "keep
           // whatever sticky state just wrote".
-          setModelSelection(draftId, carryModelSelection, { replaceOptions: true });
+          setModelSelection(draftId, nextModelSelection, { replaceOptions: true });
         }
 
         await router.navigate({

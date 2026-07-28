@@ -26,6 +26,7 @@ import { ServerSettingsService } from "../src/serverSettings.ts";
 import { AnalyticsService } from "../src/telemetry/Services/AnalyticsService.ts";
 import { SqlitePersistenceMemory } from "../src/persistence/Layers/Sqlite.ts";
 import * as ProviderSessionRuntime from "../src/persistence/ProviderSessionRuntime.ts";
+import { ServerConfig } from "../src/config.ts";
 
 import {
   makeTestProviderAdapterHarness,
@@ -72,6 +73,7 @@ const makeIntegrationFixture = Effect.gen(function* () {
     ServerSettingsService.layerTest(DEFAULT_SERVER_SETTINGS),
     AnalyticsService.layerTest,
     Layer.succeed(ProviderEventLoggers, NoOpProviderEventLoggers),
+    Layer.succeed(ServerConfig, { cwd } as never),
   ).pipe(Layer.provide(SqlitePersistenceMemory));
 
   const layer = makeProviderServiceLive().pipe(Layer.provide(shared));

@@ -2,6 +2,7 @@ import {
   EnvironmentId,
   MessageId,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
   TurnId,
@@ -14,17 +15,18 @@ import {
   MAX_HIDDEN_MOUNTED_TERMINAL_THREADS,
   branchMismatchKey,
   buildExpiredTerminalContextToastCopy,
+  buildNextComposerModelSelection,
   buildThreadTurnInterruptInput,
   createLocalDispatchSnapshot,
   deriveComposerSendState,
   dismissBranchMismatchForSession,
-  getStartedThreadModelChangeBlockReason,
   hasServerAcknowledgedLocalDispatch,
   isBranchMismatchDismissedForSession,
   reconcileMountedTerminalThreadIds,
   reconcileRetainedMountedThreadIds,
   resolveThreadMetadataUpdateForNextTurn,
   resolveSendEnvMode,
+  shouldStartNewConversationForModelSelection,
   startNewThreadForProject,
   shouldShowBranchMismatchBanner,
   shouldWriteThreadErrorToCurrentServerThread,
@@ -223,20 +225,38 @@ describe("buildExpiredTerminalContextToastCopy", () => {
   });
 });
 
-describe("getStartedThreadModelChangeBlockReason", () => {
+describe("shouldStartNewConversationForModelSelection", () => {
   const providers = [
     {
       instanceId: ProviderInstanceId.make("codex"),
+      driver: ProviderDriverKind.make("codex"),
+      continuation: { groupKey: "codex:default" },
     },
     {
       instanceId: ProviderInstanceId.make("grok"),
+      driver: ProviderDriverKind.make("grok"),
       requiresNewThreadForModelChange: true,
+    },
+    {
+      instanceId: ProviderInstanceId.make("opencode-fast"),
+      driver: ProviderDriverKind.make("opencode"),
+      continuation: { groupKey: "opencode:shared" },
+    },
+    {
+      instanceId: ProviderInstanceId.make("opencode-smart"),
+      driver: ProviderDriverKind.make("opencode"),
+      continuation: { groupKey: "opencode:shared" },
+    },
+    {
+      instanceId: ProviderInstanceId.make("opencode-other"),
+      driver: ProviderDriverKind.make("opencode"),
+      continuation: { groupKey: "opencode:other" },
     },
   ];
 
-  it("allows model changes before a provider session has started", () => {
+  it("keeps the first turn in the current conversation", () => {
     expect(
-      getStartedThreadModelChangeBlockReason({
+      shouldStartNewConversationForModelSelection({
         providers,
         hasStartedSession: false,
         currentModelSelection: {
@@ -248,29 +268,31 @@ describe("getStartedThreadModelChangeBlockReason", () => {
           model: "grok-other",
         },
       }),
-    ).toBeNull();
+    ).toBe(false);
   });
 
-  it("allows unchanged model selections for restricted providers", () => {
+  it("keeps unchanged provider/model selections in the current conversation", () => {
     expect(
-      getStartedThreadModelChangeBlockReason({
+      shouldStartNewConversationForModelSelection({
         providers,
         hasStartedSession: true,
         currentModelSelection: {
           instanceId: ProviderInstanceId.make("grok"),
           model: "grok-build",
+          options: [{ id: "agent", value: "watchman-control" }],
         },
         nextModelSelection: {
           instanceId: ProviderInstanceId.make("grok"),
           model: "grok-build",
+          options: [{ id: "agent", value: "watchman-developer" }],
         },
       }),
-    ).toBeNull();
+    ).toBe(false);
   });
 
-  it("blocks started-session model changes when either provider requires a new thread", () => {
+  it("starts a new conversation when either provider requires one", () => {
     expect(
-      getStartedThreadModelChangeBlockReason({
+      shouldStartNewConversationForModelSelection({
         providers,
         hasStartedSession: true,
         currentModelSelection: {
@@ -282,11 +304,101 @@ describe("getStartedThreadModelChangeBlockReason", () => {
           model: "grok-build",
         },
       }),
+    ).toBe(true);
+  });
+
+  it("starts a new conversation when the provider driver changes", () => {
+    expect(
+      shouldStartNewConversationForModelSelection({
+        providers,
+        hasStartedSession: true,
+        currentModelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5.4",
+        },
+        nextModelSelection: {
+          instanceId: ProviderInstanceId.make("opencode-fast"),
+          model: "glm-4.7",
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("continues through compatible instances of the same provider driver", () => {
+    expect(
+      shouldStartNewConversationForModelSelection({
+        providers,
+        hasStartedSession: true,
+        currentModelSelection: {
+          instanceId: ProviderInstanceId.make("opencode-fast"),
+          model: "glm-4.7",
+        },
+        nextModelSelection: {
+          instanceId: ProviderInstanceId.make("opencode-smart"),
+          model: "grok-4.5",
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("starts a new conversation across incompatible continuation groups", () => {
+    expect(
+      shouldStartNewConversationForModelSelection({
+        providers,
+        hasStartedSession: true,
+        currentModelSelection: {
+          instanceId: ProviderInstanceId.make("opencode-fast"),
+          model: "glm-4.7",
+        },
+        nextModelSelection: {
+          instanceId: ProviderInstanceId.make("opencode-other"),
+          model: "grok-4.5",
+        },
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("buildNextComposerModelSelection", () => {
+  it("preserves the native agent mode while changing models", () => {
+    expect(
+      buildNextComposerModelSelection({
+        current: {
+          instanceId: ProviderInstanceId.make("opencode"),
+          model: "cerebras/zai-glm-4.7",
+          options: [
+            { id: "variant", value: "fast" },
+            { id: "agent", value: "watchman-control" },
+          ],
+        },
+        nextInstanceId: ProviderInstanceId.make("opencode"),
+        nextModel: "xai/grok-4.5",
+      }),
     ).toEqual({
-      title: "Start a new chat to change models",
-      description:
-        "This provider does not allow switching models after a conversation has started.",
+      instanceId: ProviderInstanceId.make("opencode"),
+      model: "xai/grok-4.5",
+      options: [
+        { id: "variant", value: "fast" },
+        { id: "agent", value: "watchman-control" },
+      ],
     });
+  });
+
+  it("carries only the mode when changing OpenCode instances", () => {
+    expect(
+      buildNextComposerModelSelection({
+        current: {
+          instanceId: ProviderInstanceId.make("opencode"),
+          model: "cerebras/zai-glm-4.7",
+          options: [
+            { id: "variant", value: "fast" },
+            { id: "agent", value: "watchman-developer" },
+          ],
+        },
+        nextInstanceId: ProviderInstanceId.make("opencode-personal"),
+        nextModel: "xai/grok-4.5",
+      }).options,
+    ).toEqual([{ id: "agent", value: "watchman-developer" }]);
   });
 });
 

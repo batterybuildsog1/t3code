@@ -25,8 +25,10 @@ import {
   type ProviderSession,
 } from "@t3tools/contracts";
 import { causeErrorTag } from "@t3tools/shared/observability";
+import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
@@ -53,9 +55,53 @@ import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.
 import { type EventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
+import * as ServerConfig from "../../config.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
+import {
+  isWatchmanOpenCodeAgent,
+  WATCHMAN_CONTROL_AGENT,
+  WATCHMAN_DEVELOPER_AGENT,
+} from "../watchmanOpenCodeProfile.ts";
+import {
+  isWatchmanProjectWorkspace,
+  isWatchmanWorkspaceRoot,
+  resolveWatchmanProjectRoot,
+} from "../../watchmanWorkspace.ts";
 const isModelSelection = Schema.is(ModelSelection);
+
+export function shouldGrantWatchmanControlCapability(input: {
+  readonly modelSelection?: ModelSelection | undefined;
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly provider: ProviderDriverKind;
+  readonly cwd?: string | undefined;
+  readonly projectRoot?: string | undefined;
+}): boolean {
+  const agent = getModelSelectionStringOptionValue(input.modelSelection, "agent");
+  if (typeof input.projectRoot !== "string") {
+    return false;
+  }
+  if (agent === WATCHMAN_DEVELOPER_AGENT) {
+    return isWatchmanProjectWorkspace(input.cwd, input.projectRoot);
+  }
+  return (
+    agent === WATCHMAN_CONTROL_AGENT &&
+    input.provider === "opencode" &&
+    input.providerInstanceId === "opencode" &&
+    isWatchmanWorkspaceRoot(input.cwd, input.projectRoot)
+  );
+}
+
+export function isWatchmanControlProviderSelectionAllowed(input: {
+  readonly modelSelection?: ModelSelection | undefined;
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly provider: ProviderDriverKind;
+}): boolean {
+  return (
+    getModelSelectionStringOptionValue(input.modelSelection, "agent") !== WATCHMAN_CONTROL_AGENT ||
+    (input.provider === "opencode" && input.providerInstanceId === "opencode")
+  );
+}
 
 /**
  * Hook for tests that want to override the canonical event logger pulled
@@ -212,10 +258,27 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
   const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistry;
   const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+  const serverConfig = yield* ServerConfig.ServerConfig;
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
-  const prepareMcpSession = (threadId: ThreadId, providerInstanceId: ProviderInstanceId) =>
-    McpSessionRegistry.issueActiveMcpCredential({ threadId, providerInstanceId }).pipe(
+  const prepareMcpSession = (
+    threadId: ThreadId,
+    providerInstanceId: ProviderInstanceId,
+    provider: ProviderDriverKind,
+    modelSelection?: ModelSelection,
+    cwd?: string,
+  ) =>
+    McpSessionRegistry.issueActiveMcpCredential({
+      threadId,
+      providerInstanceId,
+      includeWatchmanControl: shouldGrantWatchmanControlCapability({
+        modelSelection,
+        providerInstanceId,
+        provider,
+        cwd: cwd ?? serverConfig.cwd,
+        projectRoot: resolveWatchmanProjectRoot(),
+      }),
+    }).pipe(
       Effect.tap((credential) =>
         credential
           ? Effect.sync(() => McpProviderSession.setMcpProviderSession(credential.config))
@@ -396,8 +459,26 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
       const persistedCwd = readPersistedCwd(input.binding.runtimePayload);
       const persistedModelSelection = readPersistedModelSelection(input.binding.runtimePayload);
+      if (
+        !isWatchmanControlProviderSelectionAllowed({
+          modelSelection: persistedModelSelection,
+          providerInstanceId: bindingInstanceId,
+          provider: input.binding.provider,
+        })
+      ) {
+        return yield* toValidationError(
+          input.operation,
+          "Watchman Control conversations must use an OpenCode provider.",
+        );
+      }
 
-      yield* prepareMcpSession(input.binding.threadId, bindingInstanceId);
+      yield* prepareMcpSession(
+        input.binding.threadId,
+        bindingInstanceId,
+        input.binding.provider,
+        persistedModelSelection,
+        persistedCwd,
+      );
       const resumed = yield* adapter
         .startSession({
           threadId: input.binding.threadId,
@@ -570,6 +651,18 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           (persistedBinding?.providerInstanceId === resolvedInstanceId
             ? readPersistedCwd(persistedBinding.runtimePayload)
             : undefined);
+        if (
+          !isWatchmanControlProviderSelectionAllowed({
+            modelSelection: input.modelSelection,
+            providerInstanceId: resolvedInstanceId,
+            provider: resolvedProvider,
+          })
+        ) {
+          return yield* toValidationError(
+            "ProviderService.startSession",
+            "Watchman Control conversations must use an OpenCode provider.",
+          );
+        }
         yield* Effect.annotateCurrentSpan({
           "provider.kind": resolvedProvider,
           "provider.resume_cursor.source":
@@ -590,7 +683,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           "provider.cwd.effective": effectiveCwd ?? "",
         });
         const adapter = yield* registry.getByInstance(resolvedInstanceId);
-        yield* prepareMcpSession(threadId, resolvedInstanceId);
+        yield* prepareMcpSession(
+          threadId,
+          resolvedInstanceId,
+          resolvedProvider,
+          input.modelSelection,
+          effectiveCwd,
+        );
         const session = yield* adapter
           .startSession({
             ...input,
@@ -679,13 +778,77 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         "provider.kind": routed.adapter.provider,
         ...(input.modelSelection?.model ? { "provider.model": input.modelSelection.model } : {}),
       });
-      // A turn is the clearest sign a session is still alive. The MCP
-      // credential is minted once at session start and cannot be rotated into
-      // an already-spawned agent process, so we keep the existing token valid
-      // rather than issuing a new one: sessions that go a long time between
-      // browser tool calls used to lose the toolkit outright.
-      yield* McpSessionRegistry.touchActiveMcpThread(input.threadId);
-      const turn = yield* routed.adapter.sendTurn(input);
+      const persistedBinding = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
+      const persistedModelSelection = persistedBinding
+        ? readPersistedModelSelection(persistedBinding.runtimePayload)
+        : undefined;
+      const effectiveModelSelection = input.modelSelection ?? persistedModelSelection;
+      if (
+        routed.adapter.provider === "opencode" &&
+        isWatchmanOpenCodeAgent(
+          getModelSelectionStringOptionValue(persistedModelSelection, "agent"),
+        ) !==
+          isWatchmanOpenCodeAgent(
+            getModelSelectionStringOptionValue(effectiveModelSelection, "agent"),
+          )
+      ) {
+        return yield* toValidationError(
+          "ProviderService.sendTurn",
+          "Switching between a stock OpenCode profile and a Watchman profile requires a new conversation.",
+        );
+      }
+      const effectiveCwd =
+        (persistedBinding ? readPersistedCwd(persistedBinding.runtimePayload) : undefined) ??
+        serverConfig.cwd;
+      if (
+        !isWatchmanControlProviderSelectionAllowed({
+          modelSelection: effectiveModelSelection,
+          providerInstanceId: routed.instanceId,
+          provider: routed.adapter.provider,
+        })
+      ) {
+        return yield* toValidationError(
+          "ProviderService.sendTurn",
+          "Watchman Control conversations must use an OpenCode provider.",
+        );
+      }
+      const previousWatchmanControl = shouldGrantWatchmanControlCapability({
+        modelSelection: persistedModelSelection,
+        providerInstanceId: routed.instanceId,
+        provider: routed.adapter.provider,
+        cwd: effectiveCwd,
+        projectRoot: resolveWatchmanProjectRoot(),
+      });
+      const requestedWatchmanControl = shouldGrantWatchmanControlCapability({
+        modelSelection: effectiveModelSelection,
+        providerInstanceId: routed.instanceId,
+        provider: routed.adapter.provider,
+        cwd: effectiveCwd,
+        projectRoot: resolveWatchmanProjectRoot(),
+      });
+      const turn = yield* Effect.acquireUseRelease(
+        McpSessionRegistry.setActiveMcpWatchmanControl(input.threadId, requestedWatchmanControl),
+        () =>
+          // The OpenCode process keeps using the same bearer token; update
+          // that credential's current authority and liveness instead of
+          // rotating it.
+          McpSessionRegistry.touchActiveMcpThread(input.threadId).pipe(
+            Effect.andThen(routed.adapter.sendTurn(input)),
+          ),
+        (_, dispatchExit) =>
+          Exit.isSuccess(dispatchExit)
+            ? Effect.void
+            : McpSessionRegistry.setActiveMcpWatchmanControl(
+                input.threadId,
+                previousWatchmanControl,
+              ),
+      );
+      const previousRuntimePayload =
+        persistedBinding?.runtimePayload &&
+        typeof persistedBinding.runtimePayload === "object" &&
+        !Array.isArray(persistedBinding.runtimePayload)
+          ? persistedBinding.runtimePayload
+          : {};
       yield* directory.upsert({
         threadId: input.threadId,
         provider: routed.adapter.provider,
@@ -693,7 +856,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         status: "running",
         ...(turn.resumeCursor !== undefined ? { resumeCursor: turn.resumeCursor } : {}),
         runtimePayload: {
-          ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
+          ...previousRuntimePayload,
+          cwd: effectiveCwd,
+          ...(effectiveModelSelection !== undefined
+            ? { modelSelection: effectiveModelSelection }
+            : {}),
           activeTurnId: turn.turnId,
           lastRuntimeEvent: "provider.sendTurn",
           lastRuntimeEventAt: yield* nowIso,

@@ -14,6 +14,7 @@ import * as McpProviderSession from "./McpProviderSession.ts";
 export interface McpCredentialRequest {
   readonly threadId: ThreadId;
   readonly providerInstanceId: ProviderInstanceId;
+  readonly includeWatchmanControl?: boolean;
 }
 
 export interface McpIssuedCredential {
@@ -25,6 +26,7 @@ export interface McpSessionRegistryShape {
   readonly resolve: (
     rawToken: string,
   ) => Effect.Effect<McpInvocationContext.McpInvocationScope | undefined>;
+  readonly setWatchmanControl: (threadId: ThreadId, enabled: boolean) => Effect.Effect<void>;
   /**
    * Records a sign of life for every credential bound to `threadId`. Provider
    * turns call this so that a session which is plainly alive keeps its
@@ -128,7 +130,10 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
         threadId: ThreadId.make(request.threadId),
         providerSessionId,
         providerInstanceId: ProviderInstanceId.make(request.providerInstanceId),
-        capabilities: new Set(["preview"]),
+        capabilities: new Set([
+          "preview",
+          ...(request.includeWatchmanControl ? (["watchman-control"] as const) : []),
+        ]),
         issuedAt,
       };
       yield* SynchronizedRef.update(state, ({ records }) => {
@@ -181,6 +186,28 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
     },
   );
 
+  const setWatchmanControl: McpSessionRegistryShape["setWatchmanControl"] = Effect.fn(
+    "McpSessionRegistry.setWatchmanControl",
+  )(function* (threadId, enabled) {
+    yield* SynchronizedRef.update(state, ({ records }) => {
+      const next = new Map(records);
+      for (const [tokenHash, record] of records) {
+        if (record.scope.threadId !== threadId) continue;
+        const capabilities = new Set(record.scope.capabilities);
+        if (enabled) {
+          capabilities.add("watchman-control");
+        } else {
+          capabilities.delete("watchman-control");
+        }
+        next.set(tokenHash, {
+          ...record,
+          scope: { ...record.scope, capabilities },
+        });
+      }
+      return { records: next };
+    });
+  });
+
   const revokeWhere = (predicate: (record: CredentialRecord) => boolean) =>
     SynchronizedRef.update(state, ({ records }) => ({
       records: new Map(Array.from(records).filter(([, record]) => !predicate(record))),
@@ -189,6 +216,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
   return McpSessionRegistry.of({
     issue,
     resolve,
+    setWatchmanControl,
     touch,
     revokeProviderSession: Effect.fn("McpSessionRegistry.revokeProviderSession")(
       function* (providerSessionId) {
@@ -237,6 +265,14 @@ export const issueActiveMcpCredential = (
  */
 export const touchActiveMcpThread = (threadId: ThreadId): Effect.Effect<void> =>
   activeMcpSessionRegistry ? activeMcpSessionRegistry.touch(threadId) : Effect.void;
+
+export const setActiveMcpWatchmanControl = (
+  threadId: ThreadId,
+  enabled: boolean,
+): Effect.Effect<void> =>
+  activeMcpSessionRegistry
+    ? activeMcpSessionRegistry.setWatchmanControl(threadId, enabled)
+    : Effect.void;
 
 export const revokeActiveMcpThread = (threadId: ThreadId): Effect.Effect<void> =>
   activeMcpSessionRegistry ? activeMcpSessionRegistry.revokeThread(threadId) : Effect.void;

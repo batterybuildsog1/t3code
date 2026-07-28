@@ -479,7 +479,8 @@ const projectAddCommand = Command.make("add", {
           projectId,
           title,
           workspaceRoot,
-          defaultModelSelection: ServerRuntimeStartup.getAutoBootstrapDefaultModelSelection(),
+          defaultModelSelection:
+            ServerRuntimeStartup.getAutoBootstrapDefaultModelSelection(workspaceRoot),
           createdAt: DateTime.formatIso(yield* DateTime.now),
         });
         return `Added project ${projectId} (${title}) at ${workspaceRoot}.`;

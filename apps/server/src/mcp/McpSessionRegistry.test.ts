@@ -54,6 +54,41 @@ it.effect("stores only a token hash, resolves the bearer token, and revokes by t
   }),
 );
 
+it.effect("adds physical control only when the caller explicitly scopes the credential", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1_000);
+    const issued = yield* registry.issue({
+      threadId: ThreadId.make("thread-watchman"),
+      providerInstanceId: ProviderInstanceId.make("opencode"),
+      includeWatchmanControl: true,
+    });
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+    expect((yield* registry.resolve(token))?.capabilities).toEqual(
+      new Set(["preview", "watchman-control"]),
+    );
+  }),
+);
+
+it.effect("changes physical control on the existing credential when the agent changes", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1_000);
+    const threadId = ThreadId.make("thread-watchman-mode-switch");
+    const issued = yield* registry.issue({
+      threadId,
+      providerInstanceId: ProviderInstanceId.make("opencode"),
+    });
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+
+    expect((yield* registry.resolve(token))?.capabilities).toEqual(new Set(["preview"]));
+    yield* registry.setWatchmanControl(threadId, true);
+    expect((yield* registry.resolve(token))?.capabilities).toEqual(
+      new Set(["preview", "watchman-control"]),
+    );
+    yield* registry.setWatchmanControl(threadId, false);
+    expect((yield* registry.resolve(token))?.capabilities).toEqual(new Set(["preview"]));
+  }),
+);
+
 it.effect("builds MCP endpoints from the bound server host", () =>
   Effect.gen(function* () {
     const cases = [

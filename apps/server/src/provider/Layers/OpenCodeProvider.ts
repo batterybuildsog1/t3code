@@ -23,6 +23,7 @@ import {
   type OpenCodeInventory,
 } from "../opencodeRuntime.ts";
 import type { Agent, ProviderListResponse } from "@opencode-ai/sdk/v2";
+import { isWatchmanWorkspaceRoot } from "../../watchmanWorkspace.ts";
 
 const OPENCODE_PRESENTATION = {
   displayName: "OpenCode",
@@ -160,8 +161,18 @@ function inferDefaultVariant(
   return undefined;
 }
 
-function inferDefaultAgent(agents: ReadonlyArray<Agent>): string | undefined {
-  return agents.find((agent) => agent.name === "build")?.name ?? agents[0]?.name ?? undefined;
+function inferDefaultAgent(
+  agents: ReadonlyArray<Agent>,
+  preferWatchmanControl: boolean,
+): string | undefined {
+  return (
+    (preferWatchmanControl
+      ? agents.find((agent) => agent.name === "watchman-control")?.name
+      : undefined) ??
+    agents.find((agent) => agent.name === "build")?.name ??
+    agents[0]?.name ??
+    undefined
+  );
 }
 
 const DEFAULT_OPENCODE_MODEL_CAPABILITIES: ModelCapabilities = createModelCapabilities({
@@ -172,6 +183,7 @@ function openCodeCapabilitiesForModel(input: {
   readonly providerID: string;
   readonly model: ProviderListResponse["all"][number]["models"][string];
   readonly agents: ReadonlyArray<Agent>;
+  readonly preferWatchmanControl: boolean;
 }): ModelCapabilities {
   const variantValues = Object.keys(input.model.variants ?? {});
   const defaultVariant = inferDefaultVariant(input.providerID, variantValues);
@@ -183,7 +195,7 @@ function openCodeCapabilitiesForModel(input: {
   const primaryAgents = input.agents.filter(
     (agent) => !agent.hidden && (agent.mode === "primary" || agent.mode === "all"),
   );
-  const defaultAgent = inferDefaultAgent(primaryAgents);
+  const defaultAgent = inferDefaultAgent(primaryAgents, input.preferWatchmanControl);
   const agentOptions = primaryAgents.map((agent) =>
     defaultAgent === agent.name
       ? { id: agent.name, label: titleCaseSlug(agent.name), isDefault: true as const }
@@ -217,7 +229,10 @@ function openCodeCapabilitiesForModel(input: {
   });
 }
 
-function flattenOpenCodeModels(input: OpenCodeInventory): ReadonlyArray<ServerProviderModel> {
+function flattenOpenCodeModels(
+  input: OpenCodeInventory,
+  preferWatchmanControl: boolean,
+): ReadonlyArray<ServerProviderModel> {
   const connected = new Set(input.providerList.connected);
   const models: Array<ServerProviderModel> = [];
 
@@ -242,6 +257,7 @@ function flattenOpenCodeModels(input: OpenCodeInventory): ReadonlyArray<ServerPr
           providerID: provider.id,
           model,
           agents: input.agents,
+          preferWatchmanControl,
         }),
       });
     }
@@ -412,6 +428,7 @@ export const checkOpenCodeProviderStatus = Effect.fn("checkOpenCodeProviderStatu
         )
       : openCodeRuntime.loadInventoryFromCli({
           binaryPath: openCodeSettings.binaryPath,
+          cwd,
           environment: resolvedEnvironment,
         })
     ).pipe(
@@ -425,7 +442,10 @@ export const checkOpenCodeProviderStatus = Effect.fn("checkOpenCodeProviderStatu
   }
 
   const models = providerModelsFromSettings(
-    flattenOpenCodeModels(inventoryExit.value),
+    flattenOpenCodeModels(
+      inventoryExit.value,
+      isWatchmanWorkspaceRoot(cwd, resolvedEnvironment.WATCHMAN_PROJECT_ROOT),
+    ),
     customModels,
     DEFAULT_OPENCODE_MODEL_CAPABILITIES,
   );

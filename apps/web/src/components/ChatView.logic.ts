@@ -1,15 +1,14 @@
 import {
   type EnvironmentId,
-  isProviderDriverKind,
   ProjectId,
   type ModelSelection,
-  type ProviderDriverKind,
   type ServerProvider,
   type ScopedProjectRef,
   type ScopedThreadRef,
   type ThreadId,
   type TurnId,
 } from "@t3tools/contracts";
+import { createModelSelection } from "@t3tools/shared/model";
 import { type ChatMessage, type SessionPhase, type Thread } from "../types";
 import { type ComposerImageAttachment, type DraftThreadState } from "../composerDraftStore";
 import * as Schema from "effect/Schema";
@@ -346,50 +345,25 @@ export function threadHasStarted(thread: Thread | null | undefined): boolean {
   );
 }
 
-// `threadProvider` is the open branded driver kind carried by the session.
-// Unknown driver kinds degrade to `null` (i.e. "unlocked"), which is the safe
-// rollback / fork behavior — the routing layer is the right place to surface
-// "driver not installed" errors, not the lock state.
-//
-// `selectedProvider` takes the same open-string shape because the composer
-// now tracks the picker selection as a `ProviderInstanceId` (e.g.
-// `codex_personal`). Custom instance ids that don't directly match a
-// registered driver resolve to `null` here, which matches the existing
-// "unknown driver -> unlocked" semantics. Callers that want the lock to track
-// a custom instance's underlying driver kind should resolve the instance id
-// upstream and pass the correlated kind.
-export function deriveLockedProvider(input: {
-  thread: Thread | null | undefined;
-  selectedProvider: string | null;
-  threadProvider: string | null;
-}): ProviderDriverKind | null {
-  if (!threadHasStarted(input.thread)) {
-    return null;
-  }
-  const sessionProvider = input.thread?.session?.providerName ?? null;
-  if (sessionProvider && isProviderDriverKind(sessionProvider)) {
-    return sessionProvider;
-  }
-  const narrowedThreadProvider =
-    input.threadProvider && isProviderDriverKind(input.threadProvider)
-      ? input.threadProvider
-      : null;
-  const narrowedSelectedProvider =
-    input.selectedProvider && isProviderDriverKind(input.selectedProvider)
-      ? input.selectedProvider
-      : null;
-  return narrowedThreadProvider ?? narrowedSelectedProvider ?? null;
-}
-
-export function getStartedThreadModelChangeBlockReason(input: {
-  providers: ReadonlyArray<Pick<ServerProvider, "instanceId" | "requiresNewThreadForModelChange">>;
+/**
+ * A provider/model change either continues through the provider's native
+ * resume path or starts a new T3 conversation. The previous conversation is
+ * never rewritten or copied.
+ */
+export function shouldStartNewConversationForModelSelection(input: {
+  providers: ReadonlyArray<
+    Pick<
+      ServerProvider,
+      "instanceId" | "driver" | "continuation" | "requiresNewThreadForModelChange"
+    >
+  >;
   hasStartedSession: boolean;
   currentModelSelection: ModelSelection;
   currentProviderInstanceId?: ModelSelection["instanceId"] | null | undefined;
   nextModelSelection: ModelSelection;
-}): { title: string; description: string } | null {
+}): boolean {
   if (!input.hasStartedSession) {
-    return null;
+    return false;
   }
   const currentModelSelection = {
     ...input.currentModelSelection,
@@ -399,7 +373,7 @@ export function getStartedThreadModelChangeBlockReason(input: {
     currentModelSelection.instanceId === input.nextModelSelection.instanceId &&
     currentModelSelection.model === input.nextModelSelection.model
   ) {
-    return null;
+    return false;
   }
   const currentProvider = input.providers.find(
     (snapshot) => snapshot.instanceId === currentModelSelection.instanceId,
@@ -407,16 +381,38 @@ export function getStartedThreadModelChangeBlockReason(input: {
   const nextProvider = input.providers.find(
     (snapshot) => snapshot.instanceId === input.nextModelSelection.instanceId,
   );
-  if (
-    currentProvider?.requiresNewThreadForModelChange !== true &&
-    nextProvider?.requiresNewThreadForModelChange !== true
-  ) {
-    return null;
+  if (!currentProvider || !nextProvider) {
+    return true;
   }
-  return {
-    title: "Start a new chat to change models",
-    description: "This provider does not allow switching models after a conversation has started.",
-  };
+  if (currentProvider.driver !== nextProvider.driver) {
+    return true;
+  }
+  const currentGroup = currentProvider.continuation?.groupKey;
+  const nextGroup = nextProvider.continuation?.groupKey;
+  if (currentGroup && nextGroup && currentGroup !== nextGroup) {
+    return true;
+  }
+  return (
+    currentProvider.requiresNewThreadForModelChange === true ||
+    nextProvider.requiresNewThreadForModelChange === true
+  );
+}
+
+export function buildNextComposerModelSelection(input: {
+  current: ModelSelection;
+  nextInstanceId: ModelSelection["instanceId"];
+  nextModel: string;
+}): ModelSelection {
+  const agent = input.current.options?.find((option) => option.id === "agent");
+  return createModelSelection(
+    input.nextInstanceId,
+    input.nextModel,
+    input.current.instanceId === input.nextInstanceId
+      ? input.current.options
+      : typeof agent?.value === "string"
+        ? [agent]
+        : undefined,
+  );
 }
 
 export async function waitForStartedServerThread(

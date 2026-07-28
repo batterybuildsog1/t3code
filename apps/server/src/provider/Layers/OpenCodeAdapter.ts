@@ -22,6 +22,7 @@ import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import type { OpencodeClient, Part, PermissionRequest, QuestionRequest } from "@opencode-ai/sdk/v2";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
@@ -39,7 +40,6 @@ import {
 } from "../Errors.ts";
 import { type OpenCodeAdapterShape } from "../Services/OpenCodeAdapter.ts";
 import {
-  buildOpenCodePermissionRules,
   OpenCodeRuntime,
   OpenCodeRuntimeError,
   openCodeQuestionId,
@@ -51,6 +51,13 @@ import {
   toOpenCodeQuestionAnswers,
   type OpenCodeServerConnection,
 } from "../opencodeRuntime.ts";
+import {
+  buildOpenCodeSessionPermissionRules,
+  crossesWatchmanModeBoundary,
+  isWatchmanOpenCodeAgent,
+  watchmanAgentProfileIssue,
+} from "../watchmanOpenCodeProfile.ts";
+import { isWatchmanProjectWorkspace } from "../../watchmanWorkspace.ts";
 import * as Option from "effect/Option";
 
 const PROVIDER = ProviderDriverKind.make("opencode");
@@ -68,7 +75,13 @@ const OPENCODE_RESUME_VERSION = 1 as const;
  * rather than an error. Re-adopting the session id IS the resume mechanism —
  * OpenCode scopes a conversation's history by session id.
  */
-function parseOpenCodeResume(raw: unknown): { readonly sessionId: string } | undefined {
+type OpenCodePermissionProfile = "runtime" | "watchman";
+
+function parseOpenCodeResume(
+  raw: unknown,
+):
+  | { readonly sessionId: string; readonly permissionProfile: OpenCodePermissionProfile }
+  | undefined {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
     return undefined;
   }
@@ -79,7 +92,17 @@ function parseOpenCodeResume(raw: unknown): { readonly sessionId: string } | und
   if (typeof record.sessionId !== "string" || record.sessionId.trim().length === 0) {
     return undefined;
   }
-  return { sessionId: record.sessionId.trim() };
+  if (
+    record.permissionProfile !== undefined &&
+    record.permissionProfile !== "runtime" &&
+    record.permissionProfile !== "watchman"
+  ) {
+    return undefined;
+  }
+  return {
+    sessionId: record.sessionId.trim(),
+    permissionProfile: record.permissionProfile === "watchman" ? "watchman" : "runtime",
+  };
 }
 
 /**
@@ -217,6 +240,9 @@ interface OpenCodeSessionContext {
   readonly emittedTextByPartId: Map<string, string>;
   readonly completedAssistantPartIds: Set<string>;
   readonly turns: Array<OpenCodeTurnSnapshot>;
+  readonly watchmanProfile: boolean;
+  readonly turnDispatchSemaphore: Semaphore.Semaphore;
+  selectedAgent: string | undefined;
   activeTurnId: TurnId | undefined;
   activeAgent: string | undefined;
   activeVariant: string | undefined;
@@ -1190,7 +1216,29 @@ export function makeOpenCodeAdapter(
         const serverUrl = openCodeSettings.serverUrl;
         const serverPassword = openCodeSettings.serverPassword;
         const directory = input.cwd ?? serverConfig.cwd;
-        const resumeSessionId = parseOpenCodeResume(input.resumeCursor)?.sessionId;
+        const initialAgent = getModelSelectionStringOptionValue(input.modelSelection, "agent");
+        if (
+          isWatchmanProjectWorkspace(directory, options?.environment?.WATCHMAN_PROJECT_ROOT) &&
+          !isWatchmanOpenCodeAgent(initialAgent)
+        ) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: "Watchman workspaces require an explicit Watchman Control or Developer agent.",
+          });
+        }
+        const permissionProfile: OpenCodePermissionProfile = isWatchmanOpenCodeAgent(initialAgent)
+          ? "watchman"
+          : "runtime";
+        const sessionPermission = buildOpenCodeSessionPermissionRules(
+          input.runtimeMode,
+          initialAgent,
+        );
+        const parsedResume = parseOpenCodeResume(input.resumeCursor);
+        const resumeSessionId =
+          parsedResume?.permissionProfile === permissionProfile
+            ? parsedResume.sessionId
+            : undefined;
         const existing = sessions.get(input.threadId);
         if (existing) {
           yield* stopOpenCodeContext(existing);
@@ -1214,6 +1262,16 @@ export function makeOpenCodeAdapter(
                 directory,
                 ...(server.external && serverPassword ? { serverPassword } : {}),
               });
+              if (isWatchmanOpenCodeAgent(initialAgent)) {
+                const agents = yield* runOpenCodeSdk("app.agents", () => client.app.agents());
+                const profileIssue = watchmanAgentProfileIssue(agents.data ?? [], initialAgent);
+                if (profileIssue) {
+                  return yield* new OpenCodeRuntimeError({
+                    operation: "app.agents",
+                    detail: profileIssue,
+                  });
+                }
+              }
               const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
               if (mcpSession && !server.external) {
                 yield* runOpenCodeSdk("mcp.add", () =>
@@ -1262,7 +1320,7 @@ export function makeOpenCodeAdapter(
                   yield* runOpenCodeSdk("session.update", () =>
                     client.session.update({
                       sessionID: reusable.id,
-                      permission: buildOpenCodePermissionRules(input.runtimeMode),
+                      permission: sessionPermission,
                     }),
                   );
                   return { openCodeSession: reusable, created: false };
@@ -1289,7 +1347,7 @@ export function makeOpenCodeAdapter(
                   yield* runOpenCodeSdk("session.update", () =>
                     client.session.update({
                       sessionID: forked.id,
-                      permission: buildOpenCodePermissionRules(input.runtimeMode),
+                      permission: sessionPermission,
                     }),
                   );
                   return { openCodeSession: forked, created: true };
@@ -1302,7 +1360,7 @@ export function makeOpenCodeAdapter(
                 }
                 const createdSession = yield* runOpenCodeSdk("session.create", () =>
                   client.session.create({
-                    permission: buildOpenCodePermissionRules(input.runtimeMode),
+                    permission: sessionPermission,
                   }),
                 );
                 if (!createdSession.data) {
@@ -1363,6 +1421,7 @@ export function makeOpenCodeAdapter(
           resumeCursor: {
             schemaVersion: OPENCODE_RESUME_VERSION,
             sessionId: started.openCodeSession.id,
+            ...(permissionProfile === "watchman" ? { permissionProfile } : {}),
           },
           createdAt,
           updatedAt: createdAt,
@@ -1381,6 +1440,9 @@ export function makeOpenCodeAdapter(
           messageRoleById: new Map(),
           completedAssistantPartIds: new Set(),
           turns: [],
+          watchmanProfile: isWatchmanOpenCodeAgent(initialAgent),
+          turnDispatchSemaphore: yield* Semaphore.make(1),
+          selectedAgent: initialAgent,
           activeTurnId: undefined,
           activeAgent: undefined,
           activeVariant: undefined,
@@ -1411,11 +1473,6 @@ export function makeOpenCodeAdapter(
 
     const sendTurn: OpenCodeAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
       const context = yield* ensureSessionContext(sessions, input.threadId);
-      // A sendTurn while a turn is active is a steer: OpenCode queues the
-      // prompt into the busy session and the work continues as one turn, so
-      // the active turn id is reused instead of opening a new turn.
-      const steeringTurnId = context.activeTurnId;
-      const turnId = steeringTurnId ?? TurnId.make(`opencode-turn-${yield* randomUUIDv4}`);
       const modelSelection =
         input.modelSelection ??
         (context.session.model
@@ -1454,107 +1511,162 @@ export function makeOpenCodeAdapter(
         });
       }
 
-      const agent = getModelSelectionStringOptionValue(modelSelection, "agent");
+      const requestedAgent = getModelSelectionStringOptionValue(modelSelection, "agent");
       const variant = getModelSelectionStringOptionValue(modelSelection, "variant");
 
-      context.activeTurnId = turnId;
-      context.activeAgent = agent ?? (input.interactionMode === "plan" ? "plan" : undefined);
-      context.activeVariant = variant;
-      yield* updateProviderSession(
-        context,
-        {
-          status: "running",
-          activeTurnId: turnId,
-          model: modelSelection?.model ?? context.session.model,
-        },
-        { clearLastError: true },
-      );
+      return yield* context.turnDispatchSemaphore.withPermit(
+        Effect.gen(function* () {
+          const agent =
+            requestedAgent ?? (context.watchmanProfile ? context.selectedAgent : undefined);
+          if (context.watchmanProfile !== isWatchmanOpenCodeAgent(agent)) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "sendTurn",
+              issue: context.watchmanProfile
+                ? "Watchman conversations must use the Watchman Control or Developer agent."
+                : "A Watchman agent requires a conversation started with a Watchman agent.",
+            });
+          }
+          if (isWatchmanOpenCodeAgent(agent)) {
+            const agents = yield* runOpenCodeSdk("app.agents", () =>
+              context.client.app.agents(),
+            ).pipe(Effect.mapError(toRequestError));
+            const profileIssue = watchmanAgentProfileIssue(agents.data ?? [], agent);
+            if (profileIssue) {
+              return yield* new ProviderAdapterValidationError({
+                provider: PROVIDER,
+                operation: "sendTurn",
+                issue: profileIssue,
+              });
+            }
+          }
+          if (
+            context.activeTurnId !== undefined &&
+            crossesWatchmanModeBoundary(context.activeAgent, agent)
+          ) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "sendTurn",
+              issue:
+                "Wait for or interrupt the active turn before switching between Watchman Control and Developer.",
+            });
+          }
 
-      if (steeringTurnId === undefined) {
-        yield* emit({
-          ...(yield* buildEventBase({ threadId: input.threadId, turnId })),
-          type: "turn.started",
-          payload: {
-            model: modelSelection?.model ?? context.session.model,
-            ...(variant ? { effort: variant } : {}),
-          },
-        });
-      }
+          // A sendTurn while a turn is active is a steer: OpenCode queues the
+          // prompt into the busy session and the work continues as one turn, so
+          // the active turn id is reused instead of opening a new turn.
+          const steeringTurnId = context.activeTurnId;
+          const turnId = steeringTurnId ?? TurnId.make(`opencode-turn-${yield* randomUUIDv4}`);
+          context.activeTurnId = turnId;
+          context.activeAgent = agent ?? (input.interactionMode === "plan" ? "plan" : undefined);
+          context.activeVariant = variant;
+          yield* updateProviderSession(
+            context,
+            {
+              status: "running",
+              activeTurnId: turnId,
+              model: modelSelection?.model ?? context.session.model,
+            },
+            { clearLastError: true },
+          );
 
-      yield* runOpenCodeSdk("session.promptAsync", () =>
-        context.client.session.promptAsync({
-          sessionID: context.openCodeSessionId,
-          model: parsedModel,
-          ...(context.activeAgent ? { agent: context.activeAgent } : {}),
-          ...(context.activeVariant ? { variant: context.activeVariant } : {}),
-          parts: [...(text ? [{ type: "text" as const, text }] : []), ...fileParts],
+          if (steeringTurnId === undefined) {
+            yield* emit({
+              ...(yield* buildEventBase({ threadId: input.threadId, turnId })),
+              type: "turn.started",
+              payload: {
+                model: modelSelection?.model ?? context.session.model,
+                ...(variant ? { effort: variant } : {}),
+              },
+            });
+          }
+
+          yield* runOpenCodeSdk("session.promptAsync", () =>
+            context.client.session.promptAsync({
+              sessionID: context.openCodeSessionId,
+              model: parsedModel,
+              ...(context.activeAgent ? { agent: context.activeAgent } : {}),
+              ...(context.activeVariant ? { variant: context.activeVariant } : {}),
+              parts: [...(text ? [{ type: "text" as const, text }] : []), ...fileParts],
+            }),
+          ).pipe(
+            Effect.mapError(toRequestError),
+            // On failure of a fresh turn: clear active-turn state, flip the
+            // session back to ready with lastError set, emit turn.aborted, then
+            // let the typed error propagate. We don't need to rebuild the error
+            // here — `toRequestError` already produced the right shape. A failed
+            // steer leaves the still-running original turn untouched.
+            Effect.tapError((requestError) =>
+              steeringTurnId !== undefined
+                ? Effect.void
+                : Effect.gen(function* () {
+                    context.activeTurnId = undefined;
+                    context.activeAgent = undefined;
+                    context.activeVariant = undefined;
+                    yield* updateProviderSession(
+                      context,
+                      {
+                        status: "ready",
+                        model: modelSelection?.model ?? context.session.model,
+                        lastError: requestError.detail,
+                      },
+                      { clearActiveTurnId: true },
+                    );
+                    yield* emit({
+                      ...(yield* buildEventBase({
+                        threadId: input.threadId,
+                        turnId,
+                      })),
+                      type: "turn.aborted",
+                      payload: {
+                        reason: requestError.detail,
+                      },
+                    });
+                  }),
+            ),
+          );
+          context.selectedAgent = agent;
+
+          return {
+            threadId: input.threadId,
+            turnId,
+            // Re-surface the durable cursor on every turn so the persisted binding
+            // is refreshed alongside last-seen/runtime state (mirrors Grok/Codex).
+            ...(context.session.resumeCursor !== undefined
+              ? { resumeCursor: context.session.resumeCursor }
+              : {}),
+          };
         }),
-      ).pipe(
-        Effect.mapError(toRequestError),
-        // On failure of a fresh turn: clear active-turn state, flip the
-        // session back to ready with lastError set, emit turn.aborted, then
-        // let the typed error propagate. We don't need to rebuild the error
-        // here — `toRequestError` already produced the right shape. A failed
-        // steer leaves the still-running original turn untouched.
-        Effect.tapError((requestError) =>
-          steeringTurnId !== undefined
-            ? Effect.void
-            : Effect.gen(function* () {
-                context.activeTurnId = undefined;
-                context.activeAgent = undefined;
-                context.activeVariant = undefined;
-                yield* updateProviderSession(
-                  context,
-                  {
-                    status: "ready",
-                    model: modelSelection?.model ?? context.session.model,
-                    lastError: requestError.detail,
-                  },
-                  { clearActiveTurnId: true },
-                );
-                yield* emit({
-                  ...(yield* buildEventBase({
-                    threadId: input.threadId,
-                    turnId,
-                  })),
-                  type: "turn.aborted",
-                  payload: {
-                    reason: requestError.detail,
-                  },
-                });
-              }),
-        ),
       );
-
-      return {
-        threadId: input.threadId,
-        turnId,
-        // Re-surface the durable cursor on every turn so the persisted binding
-        // is refreshed alongside last-seen/runtime state (mirrors Grok/Codex).
-        ...(context.session.resumeCursor !== undefined
-          ? { resumeCursor: context.session.resumeCursor }
-          : {}),
-      };
     });
 
     const interruptTurn: OpenCodeAdapterShape["interruptTurn"] = Effect.fn("interruptTurn")(
       function* (threadId, turnId) {
         const context = yield* ensureSessionContext(sessions, threadId);
-        yield* runOpenCodeSdk("session.abort", () =>
-          context.client.session.abort({ sessionID: context.openCodeSessionId }),
-        ).pipe(Effect.mapError(toRequestError));
-        if (turnId ?? context.activeTurnId) {
-          yield* emit({
-            ...(yield* buildEventBase({
-              threadId,
-              turnId: turnId ?? context.activeTurnId,
-            })),
-            type: "turn.aborted",
-            payload: {
-              reason: "Interrupted by user.",
-            },
-          });
-        }
+        return yield* context.turnDispatchSemaphore.withPermit(
+          Effect.gen(function* () {
+            const interruptedTurnId = turnId ?? context.activeTurnId;
+            yield* runOpenCodeSdk("session.abort", () =>
+              context.client.session.abort({ sessionID: context.openCodeSessionId }),
+            ).pipe(Effect.mapError(toRequestError));
+            context.activeTurnId = undefined;
+            context.activeAgent = undefined;
+            context.activeVariant = undefined;
+            yield* updateProviderSession(context, { status: "ready" }, { clearActiveTurnId: true });
+            if (interruptedTurnId) {
+              yield* emit({
+                ...(yield* buildEventBase({
+                  threadId,
+                  turnId: interruptedTurnId,
+                })),
+                type: "turn.aborted",
+                payload: {
+                  reason: "Interrupted by user.",
+                },
+              });
+            }
+          }),
+        );
       },
     );
 

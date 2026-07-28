@@ -138,6 +138,7 @@ export interface OpenCodeRuntimeShape {
   readonly runOpenCodeCommand: (input: {
     readonly binaryPath: string;
     readonly args: ReadonlyArray<string>;
+    readonly cwd?: string;
     readonly environment?: NodeJS.ProcessEnv;
   }) => Effect.Effect<OpenCodeCommandResult, OpenCodeRuntimeError>;
   readonly createOpenCodeSdkClient: (input: {
@@ -150,6 +151,7 @@ export interface OpenCodeRuntimeShape {
   ) => Effect.Effect<OpenCodeInventory, OpenCodeRuntimeError>;
   readonly loadInventoryFromCli: (input: {
     readonly binaryPath: string;
+    readonly cwd?: string;
     readonly environment?: NodeJS.ProcessEnv;
   }) => Effect.Effect<OpenCodeInventory, OpenCodeRuntimeError>;
 }
@@ -400,6 +402,7 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
       const child = yield* spawner.spawn(
         ChildProcess.make(spawnCommand.command, spawnCommand.args, {
           shell: spawnCommand.shell,
+          ...(input.cwd ? { cwd: input.cwd } : {}),
           ...(input.environment ? { env: input.environment } : { extendEnv: true }),
         }),
       );
@@ -662,12 +665,16 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
         runOpenCodeCommand({
           binaryPath: input.binaryPath,
           args: ["models", "--verbose"],
+          ...(input.cwd ? { cwd: input.cwd } : {}),
           ...env,
         }).pipe(Effect.exit);
       const runAgentsCli = () =>
-        runOpenCodeCommand({ binaryPath: input.binaryPath, args: ["agent", "list"], ...env }).pipe(
-          Effect.exit,
-        );
+        runOpenCodeCommand({
+          binaryPath: input.binaryPath,
+          args: ["agent", "list"],
+          ...(input.cwd ? { cwd: input.cwd } : {}),
+          ...env,
+        }).pipe(Effect.exit);
 
       // First attempt — run both in parallel
       let [modelsResult, agentsResult] = yield* Effect.all([runModelsCli(), runAgentsCli()], {

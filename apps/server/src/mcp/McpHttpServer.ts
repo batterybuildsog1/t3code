@@ -22,6 +22,9 @@ import {
   PreviewSnapshotToolkit,
   PreviewStandardToolkit,
 } from "./toolkits/preview/tools.ts";
+import { WatchmanToolkitHandlersLive } from "./toolkits/watchman/handlers.ts";
+import { WatchmanToolkit } from "./toolkits/watchman/tools.ts";
+import * as WatchmanHaCli from "./toolkits/watchman/WatchmanHaCli.ts";
 
 const unauthorized = HttpServerResponse.jsonUnsafe(
   {
@@ -216,10 +219,18 @@ export const PreviewToolkitRegistrationLive = Layer.mergeAll(
   PreviewSnapshotRegistrationLive,
 );
 
+export const WatchmanToolkitRegistrationLive = McpServer.toolkit(WatchmanToolkit).pipe(
+  Layer.provide(WatchmanToolkitHandlersLive),
+  Layer.provide(WatchmanHaCli.layerLive),
+);
+
 const McpTransportLive = McpServer.layerHttp({
   name: "T3 Code",
   version: packageJson.version,
   path: "/mcp",
 }).pipe(Layer.provide(McpAuthMiddlewareLive));
 
-export const layer = PreviewToolkitRegistrationLive.pipe(Layer.provideMerge(McpTransportLive));
+export const layer = Layer.mergeAll(
+  PreviewToolkitRegistrationLive,
+  WatchmanToolkitRegistrationLive,
+).pipe(Layer.provideMerge(McpTransportLive));
