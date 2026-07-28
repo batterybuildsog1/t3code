@@ -55,9 +55,10 @@ export const make = Effect.fn("WatchmanHaCli.make")(function* () {
           ),
         );
       if (output.code !== 0) {
+        const detail = [output.stderr.trim(), output.stdout.trim()].filter(Boolean).join(": ");
         return yield* new WatchmanHaCliError({
           operation: `${method} ${path}`,
-          message: output.stderr.trim().slice(0, 500) || `watchman-ha exited ${output.code}`,
+          message: detail.slice(0, 500) || `watchman-ha exited ${output.code}`,
         });
       }
       return yield* decodeJson(output.stdout).pipe(

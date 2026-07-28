@@ -3,6 +3,7 @@ import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts"
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import { McpSchema, McpServer } from "effect/unstable/ai";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -34,6 +35,7 @@ const state = (entity_id: string, value: string, attributes: Record<string, unkn
   state: value,
   attributes,
 });
+const encodeJson = Schema.encodeEffect(Schema.UnknownFromJsonString);
 
 const freshStates = (states: ReadonlyArray<ReturnType<typeof state>>) =>
   DateTime.now.pipe(
@@ -53,6 +55,7 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
     readonly path: string;
     readonly payload?: unknown;
   }> = [];
+  const oversizedTvMetadata = "x".repeat(50_000);
   const states = [
     state("input_select.hvac_mode", "Auto"),
     state("input_select.hvac_requested_pairs", "None"),
@@ -73,8 +76,18 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
       pair_states: { A: "off", B: "off", C: "off", D: "full_on" },
     }),
     ...["a", "b", "c", "d"].flatMap((screen) => [
-      state(`media_player.tv_${screen}_streamer`, "on", { app_id: "de.ozerov.fully" }),
-      state(`media_player.tv_${screen}_panel`, "on"),
+      state(`media_player.tv_${screen}_streamer`, "on", {
+        app_id: "de.ozerov.fully",
+        app_name: oversizedTvMetadata,
+        source: oversizedTvMetadata,
+        supported_features: oversizedTvMetadata,
+        arbitrary: oversizedTvMetadata,
+      }),
+      state(`media_player.tv_${screen}_panel`, "on", {
+        source: "HDMI",
+        source_list: Array.from({ length: 1_000 }, () => oversizedTvMetadata),
+        arbitrary: oversizedTvMetadata,
+      }),
       state(`remote.tv_${screen}_streamer`, "on"),
       state(
         `sensor.rec_${screen}_current_page`,
@@ -134,6 +147,36 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
     const status = yield* call("watchman_status", { area: "water" });
     expect(status.isError).toBe(false);
     expect(calls.at(-1)).toMatchObject({ method: "GET", path: "/api/states" });
+
+    const tvStatus = yield* call("watchman_status", { area: "tv" });
+    expect(tvStatus.isError).toBe(false);
+    expect(tvStatus.structuredContent).toMatchObject({
+      observed: {
+        screen_d: {
+          streamer: {
+            state: "on",
+            attributes: { app_id: "de.ozerov.fully" },
+          },
+          panel: { state: "on" },
+        },
+      },
+    });
+    const tvContent = tvStatus.structuredContent as {
+      readonly observed: {
+        readonly screen_d: {
+          readonly streamer: { readonly attributes: Record<string, unknown> };
+          readonly panel: { readonly attributes: Record<string, unknown> };
+        };
+      };
+    };
+    const streamerAttributes = tvContent.observed.screen_d.streamer.attributes;
+    expect(Object.keys(streamerAttributes).sort()).toEqual(["app_id", "app_name", "source"]);
+    expect(streamerAttributes.app_id).toBe("de.ozerov.fully");
+    expect(streamerAttributes.app_name).toHaveLength(160);
+    expect(streamerAttributes.source).toHaveLength(160);
+    expect(tvContent.observed.screen_d.panel.attributes).toEqual({ source: "HDMI" });
+    const encodedTvStatus = yield* encodeJson(tvStatus.structuredContent);
+    expect(encodedTvStatus.length).toBeLessThan(6_000);
 
     const invalidSpeed = yield* call("watchman_water_control", {
       operation: "set_speed_cap",

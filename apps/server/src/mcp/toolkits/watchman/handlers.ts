@@ -153,6 +153,29 @@ const compactState = (states: ReadonlyMap<string, HaState>, entityId: string) =>
     : { state: "unavailable", missing: true };
 };
 
+const compactTvState = (states: ReadonlyMap<string, HaState>, entityId: string) => {
+  const entity = states.get(entityId);
+  if (!entity) return { state: "unavailable", missing: true };
+  const selectedAttributes: Record<string, string | number | boolean> = {};
+  for (const name of ["app_id", "app_name", "source"] as const) {
+    const value = entity.attributes[name];
+    if (typeof value === "string") selectedAttributes[name] = value.slice(0, 160);
+  }
+  const volumeLevel = entity.attributes.volume_level;
+  if (typeof volumeLevel === "number" && Number.isFinite(volumeLevel)) {
+    selectedAttributes.volume_level = volumeLevel;
+  }
+  const muted = entity.attributes.is_volume_muted;
+  if (typeof muted === "boolean") selectedAttributes.is_volume_muted = muted;
+  return {
+    state: entity.state.slice(0, 120),
+    ...(Object.keys(selectedAttributes).length === 0 ? {} : { attributes: selectedAttributes }),
+    ...(entity.last_updated === undefined
+      ? {}
+      : { last_updated: entity.last_updated.slice(0, 64) }),
+  };
+};
+
 const stateValue = (states: ReadonlyMap<string, HaState>, entityId: string): string =>
   states.get(entityId)?.state ?? "unavailable";
 
@@ -221,8 +244,8 @@ const statusForArea = (
       screenLetters.map((screen) => [
         `screen_${screen}`,
         {
-          streamer: compactState(states, `media_player.tv_${screen}_streamer`),
-          panel: compactState(states, `media_player.tv_${screen}_panel`),
+          streamer: compactTvState(states, `media_player.tv_${screen}_streamer`),
+          panel: compactTvState(states, `media_player.tv_${screen}_panel`),
           policy: screen === "a" ? "dedicated_solar_dashboard" : "flexible",
         },
       ]),
