@@ -1,7 +1,9 @@
 import { expect, it } from "@effect/vitest";
 import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import { McpSchema, McpServer } from "effect/unstable/ai";
@@ -9,6 +11,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import { WatchmanToolkitHandlersLive } from "./handlers.ts";
+import * as TvdSpool from "./TvdSpool.ts";
 import { WatchmanToolkit } from "./tools.ts";
 import * as WatchmanHaCli from "./WatchmanHaCli.ts";
 
@@ -48,6 +51,94 @@ const freshStates = (states: ReadonlyArray<ReturnType<typeof state>>) =>
       }));
     }),
   );
+
+const TestCryptoLayer = Layer.succeed(
+  Crypto.Crypto,
+  Crypto.make({
+    randomBytes: (size) => globalThis.crypto.getRandomValues(new Uint8Array(size)),
+    digest: (_algorithm, data) => Effect.succeed(data),
+  }),
+);
+
+const tvdNotFound = (operation: string) =>
+  new TvdSpool.TvdSpoolError({
+    operation,
+    reason: "not_found",
+    message: `${operation} not found`,
+  });
+
+const makeTvdLayer = (overrides: Partial<TvdSpool.TvdSpool["Service"]> = {}) =>
+  Layer.succeed(
+    TvdSpool.TvdSpool,
+    TvdSpool.TvdSpool.of({
+      fileRequest: () => Effect.void,
+      readReceipt: () =>
+        Effect.succeed({
+          requested: { request_id: "daemon-request" },
+          accepted: "accepted",
+          applied: "verified",
+          observed: { screens: { d: { state: "claimed" } } },
+          evidence: "daemon witness postcondition satisfied",
+        }),
+      readHealth: () =>
+        DateTime.now.pipe(
+          Effect.map((now) => ({
+            t: DateTime.toEpochMillis(now) / 1000,
+            ok: true,
+            mode: "active" as const,
+            seq: 42,
+          })),
+        ),
+      readSnapshot: () =>
+        DateTime.now.pipe(
+          Effect.map((now) => {
+            const nowSeconds = DateTime.toEpochMillis(now) / 1000;
+            return {
+              t: nowSeconds - 12,
+              shed_active: true,
+              screens: {
+                a: {
+                  state: "pinned",
+                  foreground_pkg: "de.ozerov.fully",
+                  playing_pkg: null,
+                  claim: null,
+                  overlay: { name: null },
+                },
+                b: {
+                  state: "idle",
+                  foreground_pkg: "de.ozerov.fully",
+                  playing_pkg: null,
+                  claim: null,
+                  overlay: { name: null },
+                },
+                c: {
+                  state: "witness_unknown",
+                  foreground_pkg: null,
+                  playing_pkg: null,
+                  claim: null,
+                  overlay: { name: "unreachable" },
+                },
+                d: {
+                  state: "claimed",
+                  foreground_pkg: "com.amazon.amazonvideo.livingroom",
+                  playing_pkg: "com.amazon.amazonvideo.livingroom",
+                  claim: {
+                    source: "external",
+                    expires_at: nowSeconds + 3600,
+                  },
+                  overlay: { name: null },
+                },
+              },
+            };
+          }),
+        ),
+      receiptPollIntervalMs: 1,
+      receiptPollBudgetMs: 5,
+      ...overrides,
+    }),
+  );
+
+const DefaultTvdLayer = makeTvdLayer();
 
 it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
   const calls: Array<{
@@ -218,6 +309,8 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
   const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
     Layer.provide(WatchmanToolkitHandlersLive),
     Layer.provide(CliLayer),
+    Layer.provide(DefaultTvdLayer),
+    Layer.provide(TestCryptoLayer),
     Layer.provideMerge(McpServer.McpServer.layer),
   );
 
@@ -401,32 +494,24 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
     const tvStatus = yield* call("watchman_status", { area: "tv" });
     expect(tvStatus.isError).toBe(false);
     expect(tvStatus.structuredContent).toMatchObject({
+      source: "tvd tv_latest.json",
       observed: {
         screen_d: {
-          streamer: {
-            state: "on",
-            attributes: { app_id: "de.ozerov.fully" },
-          },
-          panel: { state: "on" },
+          state: "claimed",
+          foreground: "com.amazon.amazonvideo.livingroom",
+          playing: "com.amazon.amazonvideo.livingroom",
+          claim: { source: "external" },
+          overlay: null,
         },
+        screen_c: { state: "witness_unknown", overlay: "unreachable" },
+        shed_active: true,
+        snapshot_age_s: 12,
       },
     });
-    const tvContent = tvStatus.structuredContent as {
-      readonly observed: {
-        readonly screen_d: {
-          readonly streamer: { readonly attributes: Record<string, unknown> };
-          readonly panel: { readonly attributes: Record<string, unknown> };
-        };
-      };
-    };
-    const streamerAttributes = tvContent.observed.screen_d.streamer.attributes;
-    expect(Object.keys(streamerAttributes).sort()).toEqual(["app_id", "app_name", "source"]);
-    expect(streamerAttributes.app_id).toBe("de.ozerov.fully");
-    expect(streamerAttributes.app_name).toHaveLength(160);
-    expect(streamerAttributes.source).toHaveLength(160);
-    expect(tvContent.observed.screen_d.panel.attributes).toEqual({ source: "HDMI" });
     const encodedTvStatus = yield* encodeJson(tvStatus.structuredContent);
-    expect(encodedTvStatus.length).toBeLessThan(6_000);
+    expect(encodedTvStatus.length).toBeLessThan(1_500);
+    expect(encodedTvStatus).not.toContain("media_sessions");
+    expect(encodedTvStatus).not.toContain("field_validity");
 
     const hvacStatus = yield* call("watchman_status", { area: "hvac" });
     expect(hvacStatus.isError).toBe(false);
@@ -476,9 +561,10 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
     expect(calls.filter(({ method }) => method === "POST")).toHaveLength(0);
 
     const irrelevantTvField = yield* call("watchman_tv_control", {
-      operation: "dashboard",
+      operation: "show",
       screen: "d",
       url: "https://example.com",
+      app: "netflix",
     });
     expect(irrelevantTvField.isError).toBe(true);
     expect(calls.filter(({ method }) => method === "POST")).toHaveLength(0);
@@ -523,7 +609,7 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
 
     const postsBeforeTvA = calls.filter(({ method }) => method === "POST").length;
     const tvA = yield* call("watchman_tv_control", {
-      operation: "open_url",
+      operation: "show",
       screen: "a",
       url: "https://example.com/video",
     });
@@ -531,14 +617,14 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
     expect(calls.filter(({ method }) => method === "POST")).toHaveLength(postsBeforeTvA);
 
     const tvUrl = yield* call("watchman_tv_control", {
-      operation: "open_url",
+      operation: "show",
       screen: "d",
       url: "https://example.com/video",
     });
     expect(tvUrl.isError).toBe(false);
     expect(tvUrl.structuredContent).toMatchObject({
-      accepted: true,
-      applied: "pending",
+      accepted: "accepted",
+      applied: "verified",
     });
 
     const tvPower = yield* call("watchman_tv_control", {
@@ -547,12 +633,9 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
       power: "on",
     });
     expect(tvPower.isError).toBe(false);
-    expect(calls.find(({ path }) => path === "/api/services/remote/turn_on")).toMatchObject({
-      payload: { entity_id: ["remote.tv_d_streamer"] },
-    });
     expect(tvPower.structuredContent).toMatchObject({
-      accepted: true,
-      applied: "pending",
+      accepted: "accepted",
+      applied: "verified",
     });
 
     const pairs = yield* call("watchman_hvac_control", {
@@ -637,6 +720,8 @@ it.effect("keeps unproven speed-cap receipts pending", () => {
   const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
     Layer.provide(WatchmanToolkitHandlersLive),
     Layer.provide(CliLayer),
+    Layer.provide(DefaultTvdLayer),
+    Layer.provide(TestCryptoLayer),
     Layer.provideMerge(McpServer.McpServer.layer),
   );
   const cases: ReadonlyArray<ReceiptCase> = [
@@ -728,6 +813,8 @@ it.effect("bounds Recorder history instead of returning raw state arrays", () =>
   const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
     Layer.provide(WatchmanToolkitHandlersLive),
     Layer.provide(CliLayer),
+    Layer.provide(DefaultTvdLayer),
+    Layer.provide(TestCryptoLayer),
     Layer.provideMerge(McpServer.McpServer.layer),
   );
 
@@ -803,6 +890,8 @@ it.effect("hard-bounds operations and HVAC Recorder projections", () => {
   const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
     Layer.provide(WatchmanToolkitHandlersLive),
     Layer.provide(CliLayer),
+    Layer.provide(DefaultTvdLayer),
+    Layer.provide(TestCryptoLayer),
     Layer.provideMerge(McpServer.McpServer.layer),
   );
 
@@ -872,6 +961,8 @@ it.effect("summarizes Recorder series larger than argument-spread limits", () =>
   const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
     Layer.provide(WatchmanToolkitHandlersLive),
     Layer.provide(CliLayer),
+    Layer.provide(DefaultTvdLayer),
+    Layer.provide(TestCryptoLayer),
     Layer.provideMerge(McpServer.McpServer.layer),
   );
 
@@ -953,6 +1044,8 @@ it.effect("returns only the fresh controller-produced well summary", () => {
   const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
     Layer.provide(WatchmanToolkitHandlersLive),
     Layer.provide(CliLayer),
+    Layer.provide(DefaultTvdLayer),
+    Layer.provide(TestCryptoLayer),
     Layer.provideMerge(McpServer.McpServer.layer),
   );
 
@@ -1009,6 +1102,7 @@ it.effect("returns only the fresh controller-produced well summary", () => {
 });
 
 it.effect("rejects Watchman tools for a preview-only credential", () => {
+  let files = 0;
   const PreviewOnlyLayer = Layer.succeed(
     WatchmanHaCli.WatchmanHaCli,
     WatchmanHaCli.WatchmanHaCli.of({
@@ -1016,9 +1110,17 @@ it.effect("rejects Watchman tools for a preview-only credential", () => {
       rest: () => Effect.die("must not call Home Assistant"),
     }),
   );
+  const CapabilityTvdLayer = makeTvdLayer({
+    fileRequest: () =>
+      Effect.sync(() => {
+        files += 1;
+      }),
+  });
   const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
     Layer.provide(WatchmanToolkitHandlersLive),
     Layer.provide(PreviewOnlyLayer),
+    Layer.provide(CapabilityTvdLayer),
+    Layer.provide(TestCryptoLayer),
     Layer.provideMerge(McpServer.McpServer.layer),
   );
   const previewOnly = {
@@ -1028,214 +1130,271 @@ it.effect("rejects Watchman tools for a preview-only credential", () => {
   return Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
     const result = yield* server
-      .callTool({ name: "watchman_status", arguments: { area: "site" } })
+      .callTool({
+        name: "watchman_tv_control",
+        arguments: { operation: "power", screen: "d", power: "on" },
+      })
       .pipe(
         Effect.provideService(McpInvocationContext.McpInvocationContext, previewOnly),
         Effect.provideService(McpSchema.McpServerClient, client),
       );
     expect(result.isError).toBe(true);
+    expect(files).toBe(0);
   }).pipe(Effect.provide(TestLayer));
 });
 
-it.effect("keeps TV actions closed and TV receipts honest", () => {
-  let mode: "normal" | "partial" | "first_failure" | "readback_failure" | "missing_observer" =
-    "partial";
-  const posts: Array<{ readonly path: string; readonly payload?: unknown }> = [];
+it.effect("files exact tvd requests and passes daemon receipts through unchanged", () => {
+  const filed: Array<TvdSpool.TvdRequest> = [];
+  let receiptMode: "third_poll" | "observe_only" = "third_poll";
+  let receiptPolls = 0;
+  let expectedReceipt: TvdSpool.TvdReceipt | undefined;
   const CliLayer = Layer.succeed(
     WatchmanHaCli.WatchmanHaCli,
     WatchmanHaCli.WatchmanHaCli.of({
       readWellRunHistory: () => Effect.die("unused"),
-      rest: (method, path, payload) => {
-        if (method === "POST") {
-          posts.push({ path, ...(payload === undefined ? {} : { payload }) });
-          if (mode === "first_failure" && path === "/api/services/media_player/play_media") {
-            return new WatchmanHaCli.WatchmanHaCliError({
-              operation: `${method} ${path}`,
-              message: "first service call failed",
-            });
-          }
-          if (mode === "partial" && path === "/api/services/media_player/volume_mute") {
-            return new WatchmanHaCli.WatchmanHaCliError({
-              operation: `${method} ${path}`,
-              message: "second service call failed",
-            });
-          }
-          return Effect.succeed([]);
-        }
-        if (mode === "readback_failure") {
-          return new WatchmanHaCli.WatchmanHaCliError({
-            operation: `${method} ${path}`,
-            message: "state readback failed",
-          });
-        }
-        return freshStates([
-          state("media_player.tv_d_streamer", "on", {
-            app_id: "com.amazon.amazonvideo.livingroom",
-          }),
-          state("media_player.tv_d_panel", "off"),
-          state("remote.tv_d_streamer", "on"),
-          state(
-            "sensor.rec_d_current_page",
-            mode === "missing_observer" ? "unavailable" : "https://example.com/movie",
-          ),
-          state("switch.rec_d_screen", "on"),
-        ]);
-      },
+      rest: () => Effect.die("TV control must not call Home Assistant"),
     }),
   );
+  const TvdLayer = makeTvdLayer({
+    fileRequest: (request) =>
+      Effect.sync(() => {
+        filed.push(request);
+      }),
+    readReceipt: (id) => {
+      receiptPolls += 1;
+      if (receiptMode === "third_poll" && receiptPolls < 3) {
+        return tvdNotFound("read TV receipt");
+      }
+      expectedReceipt =
+        receiptMode === "observe_only"
+          ? {
+              requested: { request_id: id, intent: "power", screen: "d" },
+              accepted: "rejected(observe_only)",
+              applied: "failed",
+              observed: { screens: { d: { wakefulness: { value: "Awake" } } } },
+              evidence: "valid request; observe-only mode performed no TV write",
+            }
+          : {
+              requested: { request_id: id, intent: "hold", screen: "d" },
+              accepted: "accepted",
+              applied: "verified",
+              observed: { screens: { d: { state: "claimed", overlay: null } } },
+              evidence: "hold state was journaled and witnessed",
+            };
+      return Effect.succeed(expectedReceipt);
+    },
+    receiptPollIntervalMs: 1,
+    receiptPollBudgetMs: 10,
+  });
   const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
     Layer.provide(WatchmanToolkitHandlersLive),
     Layer.provide(CliLayer),
+    Layer.provide(TvdLayer),
+    Layer.provide(TestCryptoLayer),
     Layer.provideMerge(McpServer.McpServer.layer),
   );
 
   return Effect.gen(function* () {
+    yield* TestClock.setTime(1_000_000_000);
     const server = yield* McpServer.McpServer;
-    const call = (name: string, arguments_: Record<string, unknown>) =>
+    const call = (arguments_: Record<string, unknown>) =>
       server
-        .callTool({ name, arguments: arguments_ })
+        .callTool({ name: "watchman_tv_control", arguments: arguments_ })
         .pipe(
           Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
           Effect.provideService(McpSchema.McpServerClient, client),
         );
 
-    const partial = yield* call("watchman_tv_control", {
-      operation: "volume",
-      screen: "d",
-      level: 20,
-      muted: true,
-    });
-    expect(partial.isError).toBe(false);
-    expect(partial.structuredContent).toMatchObject({
-      accepted: {
-        status: "partial",
-        completed: 1,
-        planned: 2,
-        error: "second service call failed",
-      },
-      applied: "pending",
-    });
+    const holdFiber = yield* Effect.forkChild(
+      call({
+        operation: "hold",
+        screen: "d",
+        expires_at: 1_003_600,
+      }),
+    );
+    yield* TestClock.adjust("2 millis");
+    const hold = yield* Fiber.join(holdFiber);
+    expect(hold.isError).toBe(false);
+    expect(hold.structuredContent).toEqual(expectedReceipt);
+    expect(receiptPolls).toBe(3);
+    expect(filed).toHaveLength(1);
+    const request = filed[0]!;
+    expect(request.request_id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(request.request_id).toBe(request.request_id.toLowerCase());
+    expect(typeof request.issued_at).toBe("number");
+    const filedBytes = yield* encodeJson(request);
+    expect(filedBytes).toBe(
+      `{"schema":1,"request_id":"${request.request_id}","source":"t3","screen":"d","intent":"hold","payload":{"expires_at":1003600},"lease":{"class":"hold","expires_at":1003600},"issued_at":1000000,"ttl_s":120}`,
+    );
 
-    mode = "first_failure";
-    const postsBeforeFailure = posts.length;
-    const firstFailure = yield* call("watchman_tv_control", {
-      operation: "open_url",
-      screen: "d",
-      url: "https://example.com/movie",
-    });
-    expect(firstFailure.isError).toBe(true);
-    expect(posts.slice(postsBeforeFailure).map(({ path }) => path)).toEqual([
-      "/api/services/media_player/play_media",
-    ]);
-
-    mode = "readback_failure";
-    const readbackFailure = yield* call("watchman_tv_control", {
+    receiptMode = "observe_only";
+    receiptPolls = 0;
+    const observeOnly = yield* call({
       operation: "power",
       screen: "d",
       power: "on",
     });
-    expect(readbackFailure.isError).toBe(false);
-    expect(readbackFailure.structuredContent).toMatchObject({
-      accepted: true,
-      applied: "unavailable",
-      observed: { error: "state readback failed" },
+    expect(observeOnly.isError).toBe(false);
+    expect(observeOnly.structuredContent).toEqual(expectedReceipt);
+    expect(observeOnly.structuredContent).toMatchObject({
+      accepted: "rejected(observe_only)",
+      applied: "failed",
     });
+  }).pipe(Effect.provide(TestLayer));
+});
 
-    mode = "normal";
-    const postsBeforeUrl = posts.length;
-    const url = yield* call("watchman_tv_control", {
-      operation: "open_url",
-      screen: "d",
-      url: "https://example.com/movie",
-    });
-    expect(url.isError).toBe(false);
-    expect(url.structuredContent).toMatchObject({
-      accepted: true,
+it.effect("returns pending after the receipt budget and names the durable receipt path", () => {
+  const filed: Array<TvdSpool.TvdRequest> = [];
+  let receiptPolls = 0;
+  const CliLayer = Layer.succeed(
+    WatchmanHaCli.WatchmanHaCli,
+    WatchmanHaCli.WatchmanHaCli.of({
+      readWellRunHistory: () => Effect.die("unused"),
+      rest: () => Effect.die("TV control must not call Home Assistant"),
+    }),
+  );
+  const TvdLayer = makeTvdLayer({
+    fileRequest: (request) =>
+      Effect.sync(() => {
+        filed.push(request);
+      }),
+    readReceipt: () => {
+      receiptPolls += 1;
+      return tvdNotFound("read TV receipt");
+    },
+    receiptPollIntervalMs: 1,
+    receiptPollBudgetMs: 3,
+  });
+  const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
+    Layer.provide(WatchmanToolkitHandlersLive),
+    Layer.provide(CliLayer),
+    Layer.provide(TvdLayer),
+    Layer.provide(TestCryptoLayer),
+    Layer.provideMerge(McpServer.McpServer.layer),
+  );
+
+  return Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const pendingFiber = yield* Effect.forkChild(
+      server
+        .callTool({
+          name: "watchman_tv_control",
+          arguments: { operation: "power", screen: "d", power: "on" },
+        })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        ),
+    );
+    yield* TestClock.adjust("3 millis");
+    const pending = yield* Fiber.join(pendingFiber);
+    expect(pending.isError).toBe(false);
+    expect(filed).toHaveLength(1);
+    expect(receiptPolls).toBe(4);
+    const requestId = filed[0]!.request_id;
+    expect(pending.structuredContent).toMatchObject({
+      requested: { request_id: requestId },
+      accepted: "filed",
       applied: "pending",
-      safety: { streamer_observed: true, visible_panel_observed: false },
+      observed: { request_id: requestId },
     });
-    expect(posts.slice(postsBeforeUrl).map(({ path }) => path)).toEqual([
-      "/api/services/media_player/play_media",
-      "/api/services/homeassistant/update_entity",
-    ]);
+    expect(pending.structuredContent?.evidence).toContain(`request_id ${requestId}`);
+    expect(pending.structuredContent?.evidence).toContain(`tv_receipts/${requestId}.json`);
+  }).pipe(Effect.provide(TestLayer));
+});
 
-    const app = yield* call("watchman_tv_control", {
-      operation: "launch_app",
-      screen: "d",
-      app: "prime_video",
-    });
-    expect(app.isError).toBe(false);
-    expect(app.structuredContent).toMatchObject({
-      accepted: true,
-      applied: "pending",
-      safety: { streamer_observed: true, visible_panel_observed: false },
-    });
-    expect(posts.at(-1)).toMatchObject({
-      path: "/api/services/remote/turn_on",
-      payload: {
-        entity_id: ["remote.tv_d_streamer"],
-        activity: "com.amazon.amazonvideo.livingroom",
-      },
-    });
+it.effect("fails closed before filing and surfaces exclusive-create collisions", () => {
+  let mode: "normal" | "stale" | "collision" = "normal";
+  const filed: Array<TvdSpool.TvdRequest> = [];
+  const CliLayer = Layer.succeed(
+    WatchmanHaCli.WatchmanHaCli,
+    WatchmanHaCli.WatchmanHaCli.of({
+      readWellRunHistory: () => Effect.die("unused"),
+      rest: () => Effect.die("TV control must not call Home Assistant"),
+    }),
+  );
+  const TvdLayer = makeTvdLayer({
+    readHealth: () =>
+      DateTime.now.pipe(
+        Effect.map((now) => ({
+          t: DateTime.toEpochMillis(now) / 1000 - (mode === "stale" ? 181 : 0),
+          ok: true,
+          mode: "active" as const,
+          seq: 7,
+        })),
+      ),
+    fileRequest: (request) => {
+      if (mode === "collision") {
+        return new TvdSpool.TvdSpoolError({
+          operation: "file TV request",
+          reason: "collision",
+          message: "AlreadyExists: exclusive request path",
+        });
+      }
+      return Effect.sync(() => {
+        filed.push(request);
+      });
+    },
+  });
+  const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
+    Layer.provide(WatchmanToolkitHandlersLive),
+    Layer.provide(CliLayer),
+    Layer.provide(TvdLayer),
+    Layer.provide(TestCryptoLayer),
+    Layer.provideMerge(McpServer.McpServer.layer),
+  );
 
-    const powerOff = yield* call("watchman_tv_control", {
+  return Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const call = (arguments_: Record<string, unknown>) =>
+      server
+        .callTool({ name: "watchman_tv_control", arguments: arguments_ })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+
+    const tvAPowerOff = yield* call({
       operation: "power",
-      screen: "d",
+      screen: "a",
       power: "off",
     });
-    expect(powerOff.isError).toBe(false);
-    expect(powerOff.structuredContent).toMatchObject({
-      accepted: true,
-      applied: "pending",
-      safety: { visible_panel_observed: false },
-    });
+    expect(tvAPowerOff.isError).toBe(true);
+    expect(filed).toHaveLength(0);
 
-    const text = yield* call("watchman_tv_control", {
-      operation: "input_text",
-      screen: "d",
-      text: "Babe",
-    });
-    expect(text.isError).toBe(false);
-    expect(text.structuredContent).toMatchObject({ accepted: true, applied: "pending" });
-    expect(posts.at(-1)).toMatchObject({
-      path: "/api/services/remote/send_command",
-      payload: { entity_id: "remote.tv_d_streamer", command: "text:Babe" },
-    });
-
-    const search = yield* call("watchman_tv_control", {
-      operation: "navigate",
-      screen: "d",
-      moves: ["search"],
-    });
-    expect(search.isError).toBe(false);
-    expect(search.structuredContent).toMatchObject({ accepted: true, applied: "pending" });
-    expect(posts.at(-1)).toMatchObject({
-      path: "/api/services/remote/send_command",
-      payload: { entity_id: "remote.tv_d_streamer", command: ["SEARCH"] },
-    });
-
-    const all = yield* call("watchman_tv_control", {
-      operation: "open_url",
+    const allTransport = yield* call({
+      operation: "transport",
       screen: "all",
-      url: "https://example.com/movie",
+      action: "pause",
     });
-    expect(all.isError).toBe(false);
-    expect(all.structuredContent).toMatchObject({
-      requested: { effective_targets: ["b", "c", "d"], skipped: ["a"] },
-      safety: { effective_targets: ["b", "c", "d"], skipped: ["a"] },
-    });
+    expect(allTransport.isError).toBe(true);
+    expect(filed).toHaveLength(0);
 
-    mode = "missing_observer";
-    const missingObserver = yield* call("watchman_tv_control", {
-      operation: "open_url",
+    mode = "stale";
+    const stale = yield* call({
+      operation: "power",
       screen: "d",
-      url: "https://example.com/movie",
+      power: "on",
     });
-    expect(missingObserver.isError).toBe(false);
-    expect(missingObserver.structuredContent).toMatchObject({
-      accepted: true,
+    expect(stale.isError).toBe(false);
+    expect(stale.structuredContent).toMatchObject({
+      accepted: "unavailable(tvd_health_stale)",
       applied: "unavailable",
+      observed: { health: { age_s: 181 } },
     });
+    expect(filed).toHaveLength(0);
+
+    mode = "collision";
+    const collision = yield* call({
+      operation: "power",
+      screen: "d",
+      power: "on",
+    });
+    expect(collision.isError).toBe(true);
+    expect(collision.structuredContent).toBeUndefined();
+    expect(filed).toHaveLength(0);
   }).pipe(Effect.provide(TestLayer));
 });
 
@@ -1277,6 +1436,8 @@ it.effect("serializes Watchman mutations across concurrent tool calls", () => {
   const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
     Layer.provide(WatchmanToolkitHandlersLive),
     Layer.provide(CliLayer),
+    Layer.provide(DefaultTvdLayer),
+    Layer.provide(TestCryptoLayer),
     Layer.provideMerge(McpServer.McpServer.layer),
   );
 

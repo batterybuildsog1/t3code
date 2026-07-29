@@ -24,6 +24,7 @@ import {
 } from "./toolkits/preview/tools.ts";
 import { WatchmanToolkitHandlersLive } from "./toolkits/watchman/handlers.ts";
 import { WatchmanToolkit } from "./toolkits/watchman/tools.ts";
+import * as TvdSpool from "./toolkits/watchman/TvdSpool.ts";
 import * as WatchmanHaCli from "./toolkits/watchman/WatchmanHaCli.ts";
 
 const unauthorized = HttpServerResponse.jsonUnsafe(
@@ -221,6 +222,7 @@ export const PreviewToolkitRegistrationLive = Layer.mergeAll(
 
 export const WatchmanToolkitRegistrationLive = McpServer.toolkit(WatchmanToolkit).pipe(
   Layer.provide(WatchmanToolkitHandlersLive),
+  Layer.provide(TvdSpool.layerLive),
   Layer.provide(WatchmanHaCli.layerLive),
 );
 

@@ -1,10 +1,13 @@
+import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
+import * as TvdSpool from "./TvdSpool.ts";
 import * as WatchmanHaCli from "./WatchmanHaCli.ts";
 import { WatchmanControlError, WatchmanToolkit } from "./tools.ts";
 
@@ -54,24 +57,7 @@ const WELL_RUN_HISTORY_MAX_AGE_SECONDS = 15 * 60;
 const mutationSemaphore = Effect.runSync(Semaphore.make(1));
 
 const screenLetters = ["a", "b", "c", "d"] as const;
-type Screen = (typeof screenLetters)[number];
 type AppliedState = "verified" | "pending" | "rejected" | "unavailable";
-type ServiceCall = {
-  readonly domain: string;
-  readonly service: string;
-  readonly data: Record<string, unknown>;
-};
-const dashboardUrls: Record<Screen, string> = {
-  a: "https://watchman.sunhomes.io/switchboard.html#tv",
-  b: "https://watchman.sunhomes.io/display.html?screens=4&screen=2&deck=wall&interval=15",
-  c: "https://watchman.sunhomes.io/display.html?screens=4&screen=3&deck=wall&interval=15",
-  d: "https://watchman.sunhomes.io/display.html?screens=4&screen=4&deck=wall&interval=15",
-};
-const tvApps = {
-  prime_video: "com.amazon.amazonvideo.livingroom",
-  netflix: "com.netflix.ninja",
-  youtube: "com.google.android.youtube.tv",
-} as const;
 const pairHeads = {
   A: [1, 2],
   B: [3, 4],
@@ -124,6 +110,20 @@ const controller = <A>(
   effect: Effect.Effect<A, WatchmanHaCli.WatchmanHaCliError>,
 ) => effect.pipe(Effect.mapError((cause) => fail(tool, "controller", cause.message)));
 
+const tvdController = <A>(
+  tool: WatchmanToolName,
+  effect: Effect.Effect<A, TvdSpool.TvdSpoolError>,
+) =>
+  effect.pipe(
+    Effect.mapError((cause) =>
+      fail(
+        tool,
+        cause.reason === "invalid_json" ? "invalid_response" : "controller",
+        cause.message,
+      ),
+    ),
+  );
+
 const readStates = Effect.fn("WatchmanToolkit.readStates")(function* (tool: WatchmanToolName) {
   const cli = yield* WatchmanHaCli.WatchmanHaCli;
   const raw = yield* controller(tool, cli.rest("GET", "/api/states"));
@@ -145,12 +145,6 @@ const callService = Effect.fn("WatchmanToolkit.callService")(function* (
   yield* controller(tool, cli.rest("POST", `/api/services/${domain}/${service}`, data));
 });
 
-const service = (domain: string, name: string, data: Record<string, unknown>): ServiceCall => ({
-  domain,
-  service: name,
-  data,
-});
-
 const compactState = (
   states: ReadonlyMap<string, HaState>,
   entityId: string,
@@ -169,29 +163,6 @@ const compactState = (
         : [];
     }),
   );
-  return {
-    state: entity.state.slice(0, 120),
-    ...(Object.keys(selectedAttributes).length === 0 ? {} : { attributes: selectedAttributes }),
-    ...(entity.last_updated === undefined
-      ? {}
-      : { last_updated: entity.last_updated.slice(0, 64) }),
-  };
-};
-
-const compactTvState = (states: ReadonlyMap<string, HaState>, entityId: string) => {
-  const entity = states.get(entityId);
-  if (!entity) return { state: "unavailable", missing: true };
-  const selectedAttributes: Record<string, string | number | boolean> = {};
-  for (const name of ["app_id", "app_name", "source"] as const) {
-    const value = entity.attributes[name];
-    if (typeof value === "string") selectedAttributes[name] = value.slice(0, 160);
-  }
-  const volumeLevel = entity.attributes.volume_level;
-  if (typeof volumeLevel === "number" && Number.isFinite(volumeLevel)) {
-    selectedAttributes.volume_level = volumeLevel;
-  }
-  const muted = entity.attributes.is_volume_muted;
-  if (typeof muted === "boolean") selectedAttributes.is_volume_muted = muted;
   return {
     state: entity.state.slice(0, 120),
     ...(Object.keys(selectedAttributes).length === 0 ? {} : { attributes: selectedAttributes }),
@@ -258,15 +229,39 @@ const compactHvacControllerState = (states: ReadonlyMap<string, HaState>) => {
 const stateValue = (states: ReadonlyMap<string, HaState>, entityId: string): string =>
   states.get(entityId)?.state ?? "unavailable";
 
-const stateUnavailable = (states: ReadonlyMap<string, HaState>, entityId: string): boolean =>
-  !states.has(entityId) || ["unknown", "unavailable"].includes(stateValue(states, entityId));
-
 const attribute = (states: ReadonlyMap<string, HaState>, entityId: string, name: string): unknown =>
   states.get(entityId)?.attributes[name];
 
+const compactTvdSnapshot = (snapshot: TvdSpool.TvdSnapshot, nowSeconds: number) => ({
+  ...Object.fromEntries(
+    screenLetters.map((screen) => {
+      const state = snapshot.screens[screen];
+      const claim = state?.claim;
+      return [
+        `screen_${screen}`,
+        {
+          state: state?.state ?? null,
+          foreground: state?.foreground_pkg?.slice(0, 160) ?? null,
+          playing: state?.playing_pkg?.slice(0, 160) ?? null,
+          claim:
+            claim == null
+              ? null
+              : {
+                  source: claim.source?.slice(0, 80) ?? null,
+                  expires: claim.expires_at ?? null,
+                },
+          overlay: state?.overlay?.name ?? null,
+        },
+      ];
+    }),
+  ),
+  shed_active: snapshot.shed_active,
+  snapshot_age_s: Math.round(Math.max(0, nowSeconds - snapshot.t) * 10) / 10,
+});
+
 const statusForArea = (
   states: ReadonlyMap<string, HaState>,
-  area: "power" | "water" | "hvac" | "tv" | "weather" | "operations",
+  area: "power" | "water" | "hvac" | "weather" | "operations",
 ): Record<string, unknown> => {
   if (area === "power") {
     return {
@@ -357,18 +352,6 @@ const statusForArea = (
       },
     };
   }
-  if (area === "tv") {
-    return Object.fromEntries(
-      screenLetters.map((screen) => [
-        `screen_${screen}`,
-        {
-          streamer: compactTvState(states, `media_player.tv_${screen}_streamer`),
-          panel: compactTvState(states, `media_player.tv_${screen}_panel`),
-          policy: screen === "a" ? "dedicated_solar_dashboard" : "flexible",
-        },
-      ]),
-    );
-  }
   if (area === "weather") {
     return {
       weather: compactState(states, "weather.centennial", [
@@ -411,6 +394,16 @@ const status = Effect.fn("WatchmanToolkit.status")(function* (input: {
 }) {
   const tool = "watchman_status";
   yield* requireCapability(tool);
+  if (input.area === "tv") {
+    const spool = yield* TvdSpool.TvdSpool;
+    const snapshot = yield* tvdController(tool, spool.readSnapshot());
+    const nowSeconds = DateTime.toEpochMillis(yield* DateTime.now) / 1000;
+    return {
+      source: "tvd tv_latest.json",
+      area: "tv",
+      observed: compactTvdSnapshot(snapshot, nowSeconds),
+    };
+  }
   const states = yield* readStates(tool);
   if (input.area === "site") {
     return {
@@ -700,10 +693,6 @@ const history = Effect.fn("WatchmanToolkit.history")(function* (input: {
   };
 });
 
-const resolveScreens = (
-  screen: "a" | "b" | "c" | "d" | "all",
-): ReadonlyArray<(typeof screenLetters)[number]> => (screen === "all" ? screenLetters : [screen]);
-
 const mutationResult = (input: {
   readonly requested: unknown;
   readonly accepted?: unknown;
@@ -720,40 +709,37 @@ const mutationResult = (input: {
   ...(input.safety === undefined ? {} : { safety: input.safety }),
 });
 
-const dispatchTv = Effect.fn("WatchmanToolkit.dispatchTv")(function* (
-  calls: ReadonlyArray<ServiceCall>,
-) {
-  let completed = 0;
-  for (const call of calls) {
-    const result = yield* Effect.result(
-      callService("watchman_tv_control", call.domain, call.service, call.data),
-    );
-    if (Result.isFailure(result)) {
-      if (completed === 0) return yield* result.failure;
-      return {
-        status: "partial" as const,
-        completed,
-        planned: calls.length,
-        error: result.failure.message,
-      };
-    }
-    completed += 1;
-  }
-  return true;
-});
-
 const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
   readonly operation:
-    | "dashboard"
-    | "open_url"
-    | "launch_app"
-    | "navigate"
-    | "input_text"
+    | "play"
+    | "show"
+    | "scene"
+    | "transport"
     | "volume"
-    | "power";
+    | "power"
+    | "hold"
+    | "release"
+    | "navigate"
+    | "input_text";
   readonly screen: "a" | "b" | "c" | "d" | "all";
   readonly url?: string | undefined;
-  readonly app?: keyof typeof tvApps | undefined;
+  readonly app?: "netflix" | "youtube" | "disney_plus" | "prime_video" | "hulu" | undefined;
+  readonly content_id?: string | undefined;
+  readonly title_query?: string | undefined;
+  readonly view?:
+    | "solar.primary"
+    | "water.flow"
+    | "water.day"
+    | "water.well"
+    | "water.duty"
+    | "site.events"
+    | "hvac.recroom"
+    | "water.runs"
+    | undefined;
+  readonly scene_name?: "party" | undefined;
+  readonly members?: ReadonlyArray<"b" | "c" | "d"> | undefined;
+  readonly action?: "pause" | "resume" | "play_pause" | "next" | "prev" | "seek" | undefined;
+  readonly seek_s?: number | undefined;
   readonly moves?:
     | ReadonlyArray<
         "up" | "down" | "left" | "right" | "select" | "back" | "home" | "search" | "play_pause"
@@ -763,281 +749,242 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
   readonly level?: number | undefined;
   readonly muted?: boolean | undefined;
   readonly power?: "on" | "off" | undefined;
+  readonly expires_at?: number | undefined;
 }) {
   const tool = "watchman_tv_control";
   yield* requireCapability(tool);
   const allowed = {
-    dashboard: ["operation", "screen"],
-    open_url: ["operation", "screen", "url"],
-    launch_app: ["operation", "screen", "app"],
-    navigate: ["operation", "screen", "moves"],
-    input_text: ["operation", "screen", "text"],
+    play: ["operation", "screen", "app", "content_id", "title_query"],
+    show: ["operation", "screen", "view", "url"],
+    scene: ["operation", "screen", "scene_name", "members"],
+    transport: ["operation", "screen", "action", "seek_s"],
     volume: ["operation", "screen", "level", "muted"],
     power: ["operation", "screen", "power"],
+    hold: ["operation", "screen", "expires_at"],
+    release: ["operation", "screen"],
+    navigate: ["operation", "screen", "moves"],
+    input_text: ["operation", "screen", "text"],
   }[input.operation];
   const irrelevant = irrelevantParameter(tool, input, allowed);
   if (irrelevant) return yield* irrelevant;
-  let targets = resolveScreens(input.screen);
-  let requestedUrl: string | undefined;
-  let requestedApp: string | undefined;
-  let dispatch: ReadonlyArray<ServiceCall>;
-  let refresh: ReadonlyArray<string> = [];
 
-  if (input.operation === "dashboard") {
-    dispatch = [
-      service("script", "turn_on", {
-        entity_id: targets.map((screen) => `script.tv_show_dashboard_${screen}`),
-      }),
-    ];
-    refresh = targets.map((screen) => `sensor.rec_${screen}_current_page`);
-  } else if (input.operation === "open_url") {
-    if (!input.url) return yield* fail(tool, "controller", "open_url requires url.");
-    const url = yield* Effect.try({
-      try: () => new URL(input.url!),
-      catch: () => fail(tool, "controller", "URL is invalid."),
-    });
-    if (url.protocol !== "https:" || url.username || url.password) {
+  const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
+  const nowSeconds = nowMs / 1000;
+  let payload: Record<string, unknown>;
+  if (input.operation === "play") {
+    if (
+      input.app === undefined ||
+      (input.content_id === undefined) === (input.title_query === undefined)
+    ) {
       return yield* fail(
         tool,
         "controller",
-        "TV URLs must use HTTPS and must not contain credentials.",
+        "play requires app and exactly one of content_id or title_query.",
       );
     }
-    targets = targets.filter((screen) => screen !== "a");
-    if (targets.length === 0) {
-      return yield* fail(tool, "controller", "TV A is dedicated to the solar dashboard.");
-    }
-    requestedUrl = url.toString();
-    dispatch = [
-      service("media_player", "play_media", {
-        entity_id: targets.map((screen) => `media_player.tv_${screen}_streamer`),
-        media_content_type: "url",
-        media_content_id: requestedUrl,
-      }),
-    ];
-    refresh = targets.map((screen) => `sensor.rec_${screen}_current_page`);
-  } else if (input.operation === "launch_app") {
-    if (!input.app) return yield* fail(tool, "controller", "launch_app requires app.");
-    targets = targets.filter((screen) => screen !== "a");
-    if (targets.length === 0) {
-      return yield* fail(tool, "controller", "TV A is dedicated to the solar dashboard.");
-    }
-    requestedApp = tvApps[input.app];
-    dispatch = [
-      service("remote", "turn_on", {
-        entity_id: targets.map((screen) => `remote.tv_${screen}_streamer`),
-        activity: requestedApp,
-      }),
-    ];
-  } else if (input.operation === "navigate") {
-    if (input.screen === "all") {
-      return yield* fail(tool, "controller", "Navigate exactly one TV at a time.");
-    }
-    if (input.screen === "a") {
-      return yield* fail(tool, "controller", "TV A is dedicated to the solar dashboard.");
-    }
-    if (!input.moves?.length) return yield* fail(tool, "controller", "navigate requires moves.");
-    const commands = {
-      up: "DPAD_UP",
-      down: "DPAD_DOWN",
-      left: "DPAD_LEFT",
-      right: "DPAD_RIGHT",
-      select: "DPAD_CENTER",
-      back: "BACK",
-      home: "HOME",
-      search: "SEARCH",
-      play_pause: "MEDIA_PLAY_PAUSE",
+    payload = {
+      app: input.app,
+      ...(input.content_id === undefined ? {} : { content_id: input.content_id }),
+      ...(input.title_query === undefined ? {} : { title_query: input.title_query }),
     };
-    dispatch = [
-      service("remote", "send_command", {
-        entity_id: `remote.tv_${input.screen}_streamer`,
-        command: input.moves.map((move) => commands[move]),
-        delay_secs: 0.6,
-      }),
-    ];
-  } else if (input.operation === "input_text") {
-    if (input.screen === "all") {
-      return yield* fail(tool, "controller", "Type into exactly one TV at a time.");
+  } else if (input.operation === "show") {
+    if ((input.view === undefined) === (input.url === undefined)) {
+      return yield* fail(tool, "controller", "show requires exactly one of view or url.");
     }
-    if (input.screen === "a") {
-      return yield* fail(tool, "controller", "TV A is dedicated to the solar dashboard.");
+    if (input.url !== undefined) {
+      const rawUrl = input.url;
+      const url = yield* Effect.try({
+        try: () => new URL(rawUrl),
+        catch: () => fail(tool, "controller", "TV URL is invalid."),
+      });
+      if (
+        url.protocol !== "https:" ||
+        !url.hostname ||
+        url.username ||
+        url.password ||
+        Array.from(rawUrl).some((character) => character.codePointAt(0)! < 33)
+      ) {
+        return yield* fail(
+          tool,
+          "controller",
+          "TV URLs must use HTTPS, have a host, and contain no credentials or whitespace.",
+        );
+      }
     }
-    if (!input.text) return yield* fail(tool, "controller", "input_text requires text.");
-    dispatch = [
-      service("remote", "send_command", {
-        entity_id: `remote.tv_${input.screen}_streamer`,
-        command: `text:${input.text}`,
-      }),
-    ];
+    payload = input.view === undefined ? { url: input.url } : { view: input.view };
+  } else if (input.operation === "scene") {
+    if (input.scene_name === undefined) {
+      return yield* fail(tool, "controller", "scene requires scene_name.");
+    }
+    if (input.members !== undefined && new Set(input.members).size !== input.members.length) {
+      return yield* fail(tool, "controller", "scene members must be unique.");
+    }
+    if (
+      input.screen !== "all" &&
+      input.members !== undefined &&
+      (input.members.length !== 1 || input.members[0] !== input.screen)
+    ) {
+      return yield* fail(
+        tool,
+        "controller",
+        "Scene members must exactly match a single-screen target.",
+      );
+    }
+    payload = {
+      name: input.scene_name,
+      ...(input.members === undefined ? {} : { members: input.members }),
+    };
+  } else if (input.operation === "transport") {
+    if (input.action === undefined || (input.action === "seek") !== (input.seek_s !== undefined)) {
+      return yield* fail(
+        tool,
+        "controller",
+        "transport requires action and seek_s exactly when action is seek.",
+      );
+    }
+    payload = {
+      action: input.action,
+      ...(input.seek_s === undefined ? {} : { seek_s: input.seek_s }),
+    };
   } else if (input.operation === "volume") {
     if (input.level === undefined && input.muted === undefined) {
       return yield* fail(tool, "controller", "volume requires level or muted.");
     }
-    const entities = targets.map((screen) => `media_player.tv_${screen}_streamer`);
-    const calls: Array<ServiceCall> = [];
-    if (input.level !== undefined) {
-      calls.push(
-        service("media_player", "volume_set", {
-          entity_id: entities,
-          volume_level: input.level / 100,
-        }),
+    payload = {
+      ...(input.level === undefined ? {} : { level: input.level }),
+      ...(input.muted === undefined ? {} : { muted: input.muted }),
+    };
+  } else if (input.operation === "power") {
+    if (input.power === undefined) {
+      return yield* fail(tool, "controller", "power requires power on or off.");
+    }
+    payload = { state: input.power };
+  } else if (input.operation === "hold") {
+    if (
+      input.expires_at === undefined ||
+      input.expires_at <= nowSeconds ||
+      input.expires_at > nowSeconds + 24 * 60 * 60
+    ) {
+      return yield* fail(
+        tool,
+        "controller",
+        "hold requires expires_at in the future and no more than 24 hours away.",
       );
     }
-    if (input.muted !== undefined) {
-      calls.push(
-        service("media_player", "volume_mute", {
-          entity_id: entities,
-          is_volume_muted: input.muted,
-        }),
-      );
+    payload = { expires_at: input.expires_at };
+  } else if (input.operation === "release") {
+    payload = {};
+  } else if (input.operation === "navigate") {
+    if (!input.moves?.length) {
+      return yield* fail(tool, "controller", "navigate requires moves.");
     }
-    dispatch = calls;
+    payload = { moves: input.moves };
   } else {
-    if (!input.power) return yield* fail(tool, "controller", "power requires on or off.");
-    if (input.power === "off") targets = targets.filter((screen) => screen !== "a");
-    if (targets.length === 0) {
-      return yield* fail(tool, "controller", "TV A cannot be powered off from Control mode.");
+    if (input.text === undefined) {
+      return yield* fail(tool, "controller", "input_text requires text.");
     }
-    dispatch = [
-      input.power === "on"
-        ? service("remote", "turn_on", {
-            entity_id: targets.map((screen) => `remote.tv_${screen}_streamer`),
-          })
-        : service("media_player", "turn_off", {
-            entity_id: targets.map((screen) => `media_player.tv_${screen}_panel`),
-          }),
-    ];
+    payload = { text: input.text };
   }
 
-  const skipped = resolveScreens(input.screen).filter((screen) => !targets.includes(screen));
-  const requested = {
-    ...input,
-    effective_targets: targets,
-    ...(skipped.length === 0 ? {} : { skipped }),
-  };
-  const accepted = yield* dispatchTv(dispatch);
-  let refreshError: string | undefined;
-  if (refresh.length > 0) {
-    const refreshed = yield* Effect.result(
-      callService(tool, "homeassistant", "update_entity", { entity_id: refresh }),
-    );
-    if (Result.isFailure(refreshed)) refreshError = refreshed.failure.message;
+  if (
+    input.screen === "all" &&
+    ["transport", "hold", "navigate", "input_text"].includes(input.operation)
+  ) {
+    return yield* fail(tool, "controller", `${input.operation} targets exactly one screen.`);
   }
-  const statesResult = yield* Effect.result(readStates(tool));
-  const observedAt = DateTime.formatIso(yield* DateTime.now);
-  if (Result.isFailure(statesResult)) {
+  if (
+    input.screen === "a" &&
+    !(
+      input.operation === "volume" ||
+      (input.operation === "power" && input.power === "on") ||
+      (input.operation === "show" && input.view === "solar.primary")
+    )
+  ) {
+    return yield* fail(
+      tool,
+      "controller",
+      "TV A allows solar.primary restore, volume or mute, and power-on only.",
+    );
+  }
+
+  const spool = yield* TvdSpool.TvdSpool;
+  const healthResult = yield* Effect.result(spool.readHealth());
+  if (Result.isFailure(healthResult)) {
+    if (healthResult.failure.reason !== "not_found") {
+      return yield* tvdController(tool, Effect.fail(healthResult.failure));
+    }
     return mutationResult({
-      requested,
-      accepted,
+      requested: { intent: input.operation, screen: input.screen },
+      accepted: "unavailable(tvd_health_missing)",
+      applied: "unavailable",
+      observed: { health: null },
+      evidence: "tvd_health.json is missing; no TV request was filed.",
+    });
+  }
+  const healthAgeSeconds = nowSeconds - healthResult.success.t;
+  if (healthAgeSeconds > 180) {
+    return mutationResult({
+      requested: { intent: input.operation, screen: input.screen },
+      accepted: "unavailable(tvd_health_stale)",
       applied: "unavailable",
       observed: {
-        source: "Home Assistant live state",
-        observed_at: observedAt,
-        state: null,
-        error: statesResult.failure.message,
-        ...(refreshError === undefined ? {} : { refresh_error: refreshError }),
+        health: {
+          t: healthResult.success.t,
+          ok: healthResult.success.ok,
+          mode: healthResult.success.mode,
+          seq: healthResult.success.seq,
+          age_s: Math.round(healthAgeSeconds * 10) / 10,
+        },
       },
-      evidence: "Home Assistant accepted at least part of the request, but readback failed.",
-      safety: { tv_a_policy: "dedicated_solar_dashboard" },
+      evidence: "tvd_health.json is older than 180 seconds; no TV request was filed.",
     });
   }
-  const states = statesResult.success;
-  const observed = Object.fromEntries(
-    targets.map((screen) => [
-      screen,
-      {
-        streamer: {
-          state: stateValue(states, `media_player.tv_${screen}_streamer`),
-          app_id: attribute(states, `media_player.tv_${screen}_streamer`, "app_id"),
-        },
-        panel: stateValue(states, `media_player.tv_${screen}_panel`),
-        current_page: stateValue(states, `sensor.rec_${screen}_current_page`),
-        foreground_app: stateValue(states, `sensor.rec_${screen}_foreground_app`),
-        streamer_screen: stateValue(states, `switch.rec_${screen}_screen`),
-      },
-    ]),
-  );
-  const dashboardObserved =
-    input.operation === "dashboard" &&
-    targets.every(
-      (screen) => stateValue(states, `sensor.rec_${screen}_current_page`) === dashboardUrls[screen],
+
+  const crypto = yield* Crypto.Crypto;
+  const requestId = (yield* crypto.randomUUIDv4.pipe(
+    Effect.mapError((cause) => fail(tool, "controller", cause.message)),
+  )).toLowerCase();
+  const request: TvdSpool.TvdRequest = {
+    schema: 1,
+    request_id: requestId,
+    source: "t3",
+    screen: input.screen,
+    intent: input.operation,
+    payload,
+    ...(input.operation === "hold"
+      ? {
+          lease: {
+            class: "hold" as const,
+            expires_at: input.expires_at!,
+          },
+        }
+      : {}),
+    issued_at: nowSeconds,
+    ttl_s: 120,
+  };
+  yield* tvdController(tool, mutationSemaphore.withPermits(1)(spool.fileRequest(request)));
+
+  const pollStartedMs = DateTime.toEpochMillis(yield* DateTime.now);
+  const deadlineMs = pollStartedMs + spool.receiptPollBudgetMs;
+  while (true) {
+    const receiptResult = yield* Effect.result(spool.readReceipt(requestId));
+    if (Result.isSuccess(receiptResult)) return receiptResult.success;
+    if (receiptResult.failure.reason !== "not_found") {
+      return yield* tvdController(tool, Effect.fail(receiptResult.failure));
+    }
+    const pollNowMs = DateTime.toEpochMillis(yield* DateTime.now);
+    if (pollNowMs >= deadlineMs) break;
+    yield* Effect.sleep(
+      Duration.millis(Math.min(Math.max(1, spool.receiptPollIntervalMs), deadlineMs - pollNowMs)),
     );
-  const urlObserved =
-    input.operation === "open_url" &&
-    requestedUrl !== undefined &&
-    targets.every(
-      (screen) => stateValue(states, `sensor.rec_${screen}_current_page`) === requestedUrl,
-    );
-  const appObserved =
-    input.operation === "launch_app" &&
-    requestedApp !== undefined &&
-    targets.every(
-      (screen) =>
-        stateValue(states, `sensor.rec_${screen}_foreground_app`) === requestedApp ||
-        attribute(states, `media_player.tv_${screen}_streamer`, "app_id") === requestedApp,
-    );
-  const volumeVerified =
-    input.operation === "volume" &&
-    targets.every((screen) => {
-      const streamer = states.get(`media_player.tv_${screen}_streamer`);
-      const observedLevel = streamer?.attributes.volume_level;
-      const observedMuted = streamer?.attributes.is_volume_muted;
-      return (
-        (input.level === undefined ||
-          (typeof observedLevel === "number" &&
-            Math.abs(observedLevel - input.level / 100) <= 0.005)) &&
-        (input.muted === undefined || observedMuted === input.muted)
-      );
-    });
-  const requiredObserverUnavailable =
-    ((input.operation === "dashboard" || input.operation === "open_url") &&
-      targets.some((screen) => stateUnavailable(states, `sensor.rec_${screen}_current_page`))) ||
-    (input.operation === "launch_app" &&
-      targets.some(
-        (screen) =>
-          stateUnavailable(states, `sensor.rec_${screen}_foreground_app`) &&
-          typeof attribute(states, `media_player.tv_${screen}_streamer`, "app_id") !== "string",
-      ));
-  const applied =
-    accepted !== true
-      ? "pending"
-      : requiredObserverUnavailable
-        ? "unavailable"
-        : volumeVerified
-          ? "verified"
-          : "pending";
-  const streamerObserved = dashboardObserved || urlObserved || appObserved;
+  }
+
   return mutationResult({
-    requested,
-    accepted,
-    applied,
-    observed: {
-      source: "Home Assistant live state",
-      observed_at: observedAt,
-      state: observed,
-      ...(refreshError === undefined ? {} : { refresh_error: refreshError }),
-    },
-    evidence:
-      applied === "unavailable"
-        ? "The required TV observer entity is missing, unknown, or unavailable."
-        : accepted !== true
-          ? "Home Assistant accepted only part of the request; the overall result is not verified."
-          : applied === "verified"
-            ? "Fresh Home Assistant feedback matches the requested volume or mute state."
-            : streamerObserved
-              ? "The Streamer reports the requested page or foreground app, but panel visibility and active HDMI input are not directly observed."
-              : input.operation === "navigate" || input.operation === "input_text"
-                ? "Home Assistant accepted one non-retried remote input sequence; focus and typed text are not directly observable."
-                : input.operation === "volume"
-                  ? "The installed TV integration does not currently expose volume feedback, so acceptance is not physical verification."
-                  : "Home Assistant accepted the closed request, but the requested physical state was not directly observed.",
-    safety: {
-      tv_a_policy: "dedicated_solar_dashboard",
-      effective_targets: targets,
-      ...(skipped.length === 0 ? {} : { skipped }),
-      streamer_observed: streamerObserved,
-      visible_panel_observed: false,
-    },
+    requested: { request_id: requestId, intent: input.operation, screen: input.screen },
+    accepted: "filed",
+    applied: "pending",
+    observed: { request_id: requestId },
+    evidence: `request_id ${requestId} was filed; its terminal receipt remains available in tv_receipts/${requestId}.json for at least 24 hours.`,
   });
 });
 
@@ -1344,7 +1291,7 @@ const automation = Effect.fn("WatchmanToolkit.automation")(function* () {
 const handlers = {
   watchman_status: status,
   watchman_history: history,
-  watchman_tv_control: (input) => mutationSemaphore.withPermits(1)(tvControl(input)),
+  watchman_tv_control: tvControl,
   watchman_hvac_control: (input) => mutationSemaphore.withPermits(1)(hvacControl(input)),
   watchman_water_control: (input) => mutationSemaphore.withPermits(1)(waterControl(input)),
   watchman_automation: automation,

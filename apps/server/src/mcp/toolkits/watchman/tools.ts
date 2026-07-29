@@ -1,10 +1,17 @@
+import * as Crypto from "effect/Crypto";
 import * as Schema from "effect/Schema";
 import { Tool, Toolkit } from "effect/unstable/ai";
 
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
+import * as TvdSpool from "./TvdSpool.ts";
 import * as WatchmanHaCli from "./WatchmanHaCli.ts";
 
-const dependencies = [McpInvocationContext.McpInvocationContext, WatchmanHaCli.WatchmanHaCli];
+const dependencies = [
+  McpInvocationContext.McpInvocationContext,
+  WatchmanHaCli.WatchmanHaCli,
+  TvdSpool.TvdSpool,
+  Crypto.Crypto,
+];
 const screen = Schema.Literals(["a", "b", "c", "d", "all"]);
 const fahrenheit = Schema.Int.check(Schema.isBetween({ minimum: 66, maximum: 80 }));
 const noParameters = Schema.Record(Schema.String, Schema.Never);
@@ -12,17 +19,53 @@ const strictParameters = { parseOptions: { onExcessProperty: "error" } } as cons
 
 const tvParameters = Schema.Struct({
   operation: Schema.Literals([
-    "dashboard",
-    "open_url",
-    "launch_app",
-    "navigate",
-    "input_text",
+    "play",
+    "show",
+    "scene",
+    "transport",
     "volume",
     "power",
+    "hold",
+    "release",
+    "navigate",
+    "input_text",
   ]),
   screen,
-  url: Schema.optional(Schema.String.check(Schema.isMaxLength(2048))),
-  app: Schema.optional(Schema.Literals(["prime_video", "netflix", "youtube"])),
+  app: Schema.optional(
+    Schema.Literals(["netflix", "youtube", "disney_plus", "prime_video", "hulu"]),
+  ),
+  content_id: Schema.optional(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(512))),
+  title_query: Schema.optional(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(120))),
+  view: Schema.optional(
+    Schema.Literals([
+      "solar.primary",
+      "water.flow",
+      "water.day",
+      "water.well",
+      "water.duty",
+      "site.events",
+      "hvac.recroom",
+      "water.runs",
+    ]),
+  ),
+  url: Schema.optional(
+    Schema.String.check(
+      Schema.isMinLength(1),
+      Schema.isMaxLength(2048),
+      Schema.isPattern(/^https:\/\//),
+    ),
+  ),
+  scene_name: Schema.optional(Schema.Literal("party")),
+  members: Schema.optional(
+    Schema.Array(Schema.Literals(["b", "c", "d"])).check(
+      Schema.isMinLength(1),
+      Schema.isMaxLength(3),
+    ),
+  ),
+  action: Schema.optional(
+    Schema.Literals(["pause", "resume", "play_pause", "next", "prev", "seek"]),
+  ),
+  seek_s: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: -3600, maximum: 3600 }))),
   moves: Schema.optional(
     Schema.Array(
       Schema.Literals([
@@ -38,10 +81,17 @@ const tvParameters = Schema.Struct({
       ]),
     ).check(Schema.isMinLength(1), Schema.isMaxLength(12)),
   ),
-  text: Schema.optional(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(120))),
+  text: Schema.optional(
+    Schema.String.check(
+      Schema.isMinLength(1),
+      Schema.isMaxLength(120),
+      Schema.isPattern(/^[\x20-\x7e]+$/),
+    ),
+  ),
   level: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 100 }))),
   muted: Schema.optional(Schema.Boolean),
   power: Schema.optional(Schema.Literals(["on", "off"])),
+  expires_at: Schema.optional(Schema.Finite),
 }).annotate(strictParameters);
 
 const hvacParameters = Schema.Struct({
@@ -127,7 +177,7 @@ export const WatchmanHistoryTool = readTool(
 export const WatchmanTvControlTool = mutationTool(
   Tool.make("watchman_tv_control", {
     description:
-      "Control the TV wall through closed Home Assistant targets. TV A allows dashboard, volume, mute, and power-on only; 'all' content or power-off means all eligible flexible screens B-D and the receipt names skipped targets. Prime Video, Netflix, and YouTube can be launched directly. Search input is a separate non-retried remote sequence whose focus cannot be verified.",
+      "File a typed request to the resident tvd controller and return its five-part requested/accepted/applied/observed/evidence receipt. Supported apps are Netflix, YouTube, Disney+, Prime Video, and Hulu. TV A is fail-closed to solar.primary restore, volume/mute, and power-on only; eligible 'all' requests target the flexible TVs B-D. Verification is honest: verified means tvd witnessed the verb-specific postcondition, while pending, unavailable, rejected, superseded, failed, or indeterminate must be reported unchanged.",
     parameters: tvParameters,
     success: result,
     failure: WatchmanControlError,
