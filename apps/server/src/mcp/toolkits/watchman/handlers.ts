@@ -26,6 +26,16 @@ const HaState = Schema.Struct({
 type HaState = typeof HaState.Type;
 const HaStates = Schema.Array(HaState);
 const decodeStates = Schema.decodeUnknownEffect(HaStates);
+const RecorderPoint = Schema.Struct({
+  entity_id: Schema.optional(Schema.String),
+  state: Schema.String,
+  attributes: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+  last_changed: Schema.optional(Schema.String),
+  last_updated: Schema.optional(Schema.String),
+});
+type RecorderPoint = typeof RecorderPoint.Type;
+const RecorderHistory = Schema.Array(Schema.Array(RecorderPoint));
+const decodeRecorderHistory = Schema.decodeUnknownEffect(RecorderHistory);
 const WellRunHistory = Schema.Struct({
   generated: Schema.String,
   drives: Schema.Struct({
@@ -454,6 +464,128 @@ const historyEntities = {
 } as const;
 type HistoryMetric = keyof typeof historyEntities | "well_runs";
 
+const historyPoint = (point: RecorderPoint, stateLength = 120) => ({
+  state: point.state.slice(0, stateLength),
+  at: (point.last_changed ?? point.last_updated ?? "unknown").slice(0, 64),
+});
+
+const recentRecorderPoints = (data: ReadonlyArray<ReadonlyArray<RecorderPoint>>, limit: number) => {
+  let pointCount = 0;
+  const recent: Array<RecorderPoint> = [];
+  for (const series of data) {
+    for (const point of series) {
+      pointCount += 1;
+      recent.push(point);
+      if (recent.length > limit) recent.shift();
+    }
+  }
+  return { pointCount, recent };
+};
+
+const operationAttributeLimits = {
+  occurred_at: 48,
+  system: 32,
+  severity: 16,
+  lifecycle: 16,
+  headline: 96,
+  reason: 96,
+  impact: 96,
+  risk: 16,
+  next_action: 96,
+  actor: 48,
+  evidence: 32,
+} as const;
+
+const boundedRecorderHistory = (
+  metric: Exclude<HistoryMetric, "well_runs">,
+  data: ReadonlyArray<ReadonlyArray<RecorderPoint>>,
+) => {
+  if (metric === "operations") {
+    const { pointCount, recent } = recentRecorderPoints(data, 2);
+    return {
+      point_count: pointCount,
+      recent_events: recent.map((point) => {
+        const attributes = point.attributes ?? {};
+        const selected = Object.fromEntries(
+          Object.entries(operationAttributeLimits).flatMap(([name, limit]) => {
+            const value = attributes[name];
+            return typeof value === "string" || typeof value === "boolean"
+              ? [[name, typeof value === "string" ? value.slice(0, limit) : value]]
+              : [];
+          }),
+        );
+        return {
+          ...historyPoint(point, 64),
+          ...(Object.keys(selected).length === 0 ? {} : { attributes: selected }),
+        };
+      }),
+    };
+  }
+  if (metric === "hvac_mode") {
+    const { pointCount, recent } = recentRecorderPoints(data, 8);
+    return {
+      point_count: pointCount,
+      recent_transitions: recent.map((point) => historyPoint(point, 40)),
+    };
+  }
+  const unit = {
+    battery_soc: "%",
+    solar_power: "W",
+    site_load: "W",
+    well_pressure: "psi",
+    well_frequency: "Hz",
+  }[metric];
+  let pointCount = 0;
+  let numericPointCount = 0;
+  let min: number | undefined;
+  let max: number | undefined;
+  let firstNumeric: { readonly value: number; readonly at: string } | undefined;
+  let latestNumeric: { readonly value: number; readonly at: string } | undefined;
+  let latestObservation: ReturnType<typeof historyPoint> | undefined;
+  const recent: Array<ReturnType<typeof historyPoint>> = [];
+  for (const series of data) {
+    for (const point of series) {
+      pointCount += 1;
+      latestObservation = historyPoint(point);
+      recent.push(latestObservation);
+      if (recent.length > 8) recent.shift();
+      const value = Number(point.state);
+      if (!Number.isFinite(value)) continue;
+      const numericPoint = { value, at: latestObservation.at };
+      numericPointCount += 1;
+      min = min === undefined || value < min ? value : min;
+      max = max === undefined || value > max ? value : max;
+      firstNumeric ??= numericPoint;
+      latestNumeric = numericPoint;
+    }
+  }
+  if (
+    numericPointCount === 0 ||
+    min === undefined ||
+    max === undefined ||
+    firstNumeric === undefined ||
+    latestNumeric === undefined
+  ) {
+    return {
+      unit,
+      point_count: pointCount,
+      numeric_point_count: 0,
+      recent,
+    };
+  }
+  const round = (value: number): number => Number(value.toFixed(3));
+  return {
+    unit,
+    point_count: pointCount,
+    numeric_point_count: numericPointCount,
+    min: round(min),
+    max: round(max),
+    first_numeric: firstNumeric,
+    latest_numeric: latestNumeric,
+    latest_observation: latestObservation,
+  };
+};
+
 const history = Effect.fn("WatchmanToolkit.history")(function* (input: {
   readonly metric: HistoryMetric;
   readonly days?: number | undefined;
@@ -536,16 +668,21 @@ const history = Effect.fn("WatchmanToolkit.history")(function* (input: {
     ...(includeAttributes ? {} : { minimal_response: "", no_attributes: "" }),
     significant_changes_only: "",
   });
-  const data = yield* controller(
+  const raw = yield* controller(
     tool,
     cli.rest("GET", `/api/history/period/${encodeURIComponent(start)}?${query.toString()}`),
+  );
+  const data = yield* decodeRecorderHistory(raw).pipe(
+    Effect.mapError(() =>
+      fail(tool, "invalid_response", "Home Assistant returned invalid Recorder history."),
+    ),
   );
   return {
     source: "Home Assistant Recorder",
     metric: input.metric,
     entity_id: entityId,
     requested_days: days,
-    data,
+    summary: boundedRecorderHistory(input.metric, data),
   };
 });
 

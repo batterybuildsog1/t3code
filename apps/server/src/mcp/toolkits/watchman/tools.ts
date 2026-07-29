@@ -104,7 +104,7 @@ export const WatchmanStatusTool = readTool(
 export const WatchmanHistoryTool = readTool(
   Tool.make("watchman_history", {
     description:
-      "Read up to 30 days of allowlisted Home Assistant history or the Watchman operations journal. well_runs returns the small controller-derived summary for today and accepts days omitted or 1. This never accepts an arbitrary entity ID.",
+      "Read bounded history only when the user explicitly asks about an earlier period, trend, or runtime. For current conditions use watchman_status and do not add history. Numeric metrics return range and endpoint summaries for the requested window; operations and HVAC return only recent events or transitions. Supports up to 30 days of allowlisted Home Assistant history. well_runs returns the controller-derived summary for today and accepts days omitted or 1. This never accepts an arbitrary entity ID.",
     parameters: Schema.Struct({
       metric: Schema.Literals([
         "operations",

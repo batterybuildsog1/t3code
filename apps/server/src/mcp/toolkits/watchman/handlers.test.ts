@@ -517,6 +517,199 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
   }).pipe(Effect.provide(TestLayer));
 });
 
+it.effect("bounds Recorder history instead of returning raw state arrays", () => {
+  const oversized = "z".repeat(50_000);
+  const CliLayer = Layer.succeed(
+    WatchmanHaCli.WatchmanHaCli,
+    WatchmanHaCli.WatchmanHaCli.of({
+      readWellRunHistory: () => Effect.die("unused"),
+      rest: () =>
+        Effect.succeed([
+          Array.from({ length: 240 }, (_, index) => ({
+            entity_id: "sensor.well_rsi_output_frequency",
+            state: String(index % 120),
+            attributes: { arbitrary: oversized },
+            last_changed: "2026-07-28T12:00:00.000Z",
+            last_updated: "2026-07-28T12:00:00.000Z",
+          })),
+        ]),
+    }),
+  );
+  const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
+    Layer.provide(WatchmanToolkitHandlersLive),
+    Layer.provide(CliLayer),
+    Layer.provideMerge(McpServer.McpServer.layer),
+  );
+
+  return Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const result = yield* server
+      .callTool({
+        name: "watchman_history",
+        arguments: { metric: "well_frequency", days: 1 },
+      })
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      source: "Home Assistant Recorder",
+      metric: "well_frequency",
+      requested_days: 1,
+      summary: {
+        unit: "Hz",
+        point_count: 240,
+        numeric_point_count: 240,
+        min: 0,
+        max: 119,
+        first_numeric: { value: 0, at: "2026-07-28T12:00:00.000Z" },
+        latest_numeric: { value: 119, at: "2026-07-28T12:00:00.000Z" },
+        latest_observation: { state: "119", at: "2026-07-28T12:00:00.000Z" },
+      },
+    });
+    expect(result.structuredContent).not.toHaveProperty("data");
+    const encoded = yield* encodeJson(result.structuredContent);
+    expect(encoded.length).toBeLessThan(800);
+    expect(encoded).not.toContain("arbitrary");
+    expect(encoded).not.toContain(oversized.slice(0, 100));
+  }).pipe(Effect.provide(TestLayer));
+});
+
+it.effect("hard-bounds operations and HVAC Recorder projections", () => {
+  const oversized = "z".repeat(50_000);
+  const operationPoints = Array.from({ length: 100 }, (_, index) => ({
+    entity_id: "sensor.watchman_site_event",
+    state: `event-${index}-${oversized}`,
+    attributes: {
+      occurred_at: oversized,
+      system: oversized,
+      severity: oversized,
+      lifecycle: oversized,
+      headline: oversized,
+      reason: oversized,
+      impact: oversized,
+      risk: oversized,
+      next_action: oversized,
+      actor: oversized,
+      evidence: oversized,
+      arbitrary: oversized,
+    },
+    last_changed: `2026-07-28T12:${String(index % 60).padStart(2, "0")}:00.000Z`,
+  }));
+  const hvacPoints = Array.from({ length: 100 }, (_, index) => ({
+    entity_id: "input_select.hvac_mode",
+    state: `${index}-${oversized}`,
+    last_changed: `2026-07-28T12:${String(index % 60).padStart(2, "0")}:00.000Z`,
+  }));
+  const CliLayer = Layer.succeed(
+    WatchmanHaCli.WatchmanHaCli,
+    WatchmanHaCli.WatchmanHaCli.of({
+      readWellRunHistory: () => Effect.die("unused"),
+      rest: (_method, path) =>
+        Effect.succeed([path.includes("watchman_site_event") ? operationPoints : hvacPoints]),
+    }),
+  );
+  const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
+    Layer.provide(WatchmanToolkitHandlersLive),
+    Layer.provide(CliLayer),
+    Layer.provideMerge(McpServer.McpServer.layer),
+  );
+
+  return Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const callHistory = (metric: "operations" | "hvac_mode") =>
+      server
+        .callTool({
+          name: "watchman_history",
+          arguments: { metric, days: 1 },
+        })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+
+    const operations = yield* callHistory("operations");
+    expect(operations.isError).toBe(false);
+    expect(operations.structuredContent).toMatchObject({
+      summary: {
+        point_count: 100,
+        recent_events: [
+          { state: `event-98-${"z".repeat(55)}` },
+          { state: `event-99-${"z".repeat(55)}` },
+        ],
+      },
+    });
+    const encodedOperations = yield* encodeJson(operations.structuredContent);
+    expect(encodedOperations.length).toBeLessThan(2_000);
+    expect(encodedOperations).not.toContain("arbitrary");
+
+    const hvac = yield* callHistory("hvac_mode");
+    expect(hvac.isError).toBe(false);
+    expect(hvac.structuredContent).toMatchObject({
+      summary: {
+        point_count: 100,
+        recent_transitions: Array.from({ length: 8 }, (_, offset) => {
+          const index = 92 + offset;
+          return {
+            state: `${index}-${"z".repeat(37)}`,
+            at: `2026-07-28T12:${String(index % 60).padStart(2, "0")}:00.000Z`,
+          };
+        }),
+      },
+    });
+    const encodedHvac = yield* encodeJson(hvac.structuredContent);
+    expect(encodedHvac.length).toBeLessThan(1_200);
+  }).pipe(Effect.provide(TestLayer));
+});
+
+it.effect("summarizes Recorder series larger than argument-spread limits", () => {
+  const pointCount = 130_000;
+  const CliLayer = Layer.succeed(
+    WatchmanHaCli.WatchmanHaCli,
+    WatchmanHaCli.WatchmanHaCli.of({
+      readWellRunHistory: () => Effect.die("unused"),
+      rest: () =>
+        Effect.succeed([
+          Array.from({ length: pointCount }, (_, index) => ({
+            entity_id: "sensor.well_rsi_output_frequency",
+            state: String(index % 120),
+            last_changed: "2026-07-28T12:00:00.000Z",
+          })),
+        ]),
+    }),
+  );
+  const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
+    Layer.provide(WatchmanToolkitHandlersLive),
+    Layer.provide(CliLayer),
+    Layer.provideMerge(McpServer.McpServer.layer),
+  );
+
+  return Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const result = yield* server
+      .callTool({
+        name: "watchman_history",
+        arguments: { metric: "well_frequency", days: 30 },
+      })
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      summary: {
+        point_count: pointCount,
+        numeric_point_count: pointCount,
+        min: 0,
+        max: 119,
+      },
+    });
+    const encoded = yield* encodeJson(result.structuredContent);
+    expect(encoded.length).toBeLessThan(800);
+  }).pipe(Effect.provide(TestLayer));
+});
+
 it.effect("returns only the fresh controller-produced well summary", () => {
   let mode: "valid" | "missing" | "invalid" | "stale" | "future" | "previous_day" | "negative" =
     "valid";
