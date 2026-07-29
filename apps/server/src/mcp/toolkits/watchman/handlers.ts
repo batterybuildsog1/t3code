@@ -325,6 +325,8 @@ const statusForArea = (
         "ctrl_error",
         "ctrl_command_age_s",
         "ctrl_lease_remaining_s",
+        "pressure_cap_hz",
+        "user_cap_hz",
       ]),
       expected_start: compactState(states, "sensor.well_start_forecast", [
         "start_local",
@@ -1263,6 +1265,21 @@ const waterControl = Effect.fn("WatchmanToolkit.waterControl")(function* (input:
   const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
   const snapshotFresh =
     Number.isFinite(lastUpdatedMs) && nowMs - lastUpdatedMs >= 0 && nowMs - lastUpdatedMs <= 30_000;
+  const requestedSpeedCap = input.operation === "set_speed_cap" ? input.max_hz : undefined;
+  const observedUserCap = drive?.attributes.user_cap_hz;
+  const observedPhysicalCap = drive?.attributes.pressure_cap_hz;
+  const speedCapVerified =
+    requestedSpeedCap !== undefined &&
+    drive?.state === "True" &&
+    drive.attributes.mode === "poller-v3" &&
+    typeof observedUserCap === "number" &&
+    Number.isFinite(observedUserCap) &&
+    observedUserCap === requestedSpeedCap &&
+    typeof observedPhysicalCap === "number" &&
+    Number.isFinite(observedPhysicalCap) &&
+    observedPhysicalCap >= 102 &&
+    observedPhysicalCap <= requestedSpeedCap &&
+    snapshotFresh;
   const expectedHeld = requestedMode === "hold";
   const controlVerified =
     requestedMode !== undefined &&
@@ -1279,14 +1296,25 @@ const waterControl = Effect.fn("WatchmanToolkit.waterControl")(function* (input:
     commandAge >= 0 &&
     commandAge <= 30 &&
     snapshotFresh;
-  const applied = requestedMode !== undefined && controlVerified ? "verified" : "pending";
+  const applied =
+    requestedSpeedCap !== undefined
+      ? speedCapVerified
+        ? "verified"
+        : "pending"
+      : requestedMode !== undefined && controlVerified
+        ? "verified"
+        : "pending";
   return mutationResult({
     requested: input,
     applied,
     observed: statusForArea(states, "water"),
     evidence:
       input.operation === "set_speed_cap"
-        ? "Home Assistant accepted the helper value; the sole-owner poller performs the physical ID102 write/readback, which is not yet exposed as an HA attribute."
+        ? speedCapVerified
+          ? observedPhysicalCap === requestedSpeedCap
+            ? "A fresh sole-owner poller snapshot confirms the requested user ceiling and matching physical ID102 readback."
+            : "A fresh sole-owner poller snapshot confirms the requested user ceiling and physical ID102 readback below that ceiling."
+          : "Home Assistant accepted the helper value; a fresh sole-owner poller snapshot has not yet confirmed the requested ceiling and physical ID102 at or below it."
         : applied === "verified"
           ? "A fresh sole-owner poller snapshot acknowledges the request with matching requested/applied mode, held state, and no control error."
           : "The controller accepted the request; a fresh complete poller acknowledgment is pending, stale, errored, or safety-held.",
@@ -1294,6 +1322,8 @@ const waterControl = Effect.fn("WatchmanToolkit.waterControl")(function* (input:
       automatic_means: "return controller authority; not start-now",
       ctrl_ack: drive?.attributes.ctrl_ack,
       ctrl_error: drive?.attributes.ctrl_error,
+      observed_user_cap_hz: observedUserCap,
+      actual_id102_cap_hz: observedPhysicalCap,
       safety_latch: attribute(states, "sensor.well_solar_controller", "safety_latch"),
     },
   });

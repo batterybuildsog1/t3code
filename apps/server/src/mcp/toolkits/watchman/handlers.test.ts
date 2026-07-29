@@ -145,6 +145,8 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
       ctrl_error: null,
       ctrl_held: true,
       ctrl_command_age_s: 1,
+      pressure_cap_hz: 108,
+      user_cap_hz: 110,
       arbitrary: oversizedHvacMetadata,
     }),
     state("sensor.well_solar_controller", "HOLD", {
@@ -262,6 +264,8 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
             ctrl_applied_mode: "hold",
             ctrl_ack: true,
             ctrl_error: null,
+            pressure_cap_hz: 108,
+            user_cap_hz: 110,
           },
         },
         expected_start: {
@@ -479,6 +483,34 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
     expect(irrelevantTvField.isError).toBe(true);
     expect(calls.filter(({ method }) => method === "POST")).toHaveLength(0);
 
+    const verifiedSafetyClampedSpeed = yield* call("watchman_water_control", {
+      operation: "set_speed_cap",
+      max_hz: 110,
+    });
+    expect(verifiedSafetyClampedSpeed.isError).toBe(false);
+    expect(verifiedSafetyClampedSpeed.structuredContent).toMatchObject({
+      accepted: true,
+      applied: "verified",
+      safety: {
+        observed_user_cap_hz: 110,
+        actual_id102_cap_hz: 108,
+      },
+    });
+
+    const pendingUnconfirmedSpeed = yield* call("watchman_water_control", {
+      operation: "set_speed_cap",
+      max_hz: 109,
+    });
+    expect(pendingUnconfirmedSpeed.isError).toBe(false);
+    expect(pendingUnconfirmedSpeed.structuredContent).toMatchObject({
+      accepted: true,
+      applied: "pending",
+      safety: {
+        observed_user_cap_hz: 110,
+        actual_id102_cap_hz: 108,
+      },
+    });
+
     const hold = yield* call("watchman_water_control", { operation: "hold" });
     expect(hold.isError).toBe(false);
     expect(calls.find(({ path }) => path === "/api/services/script/turn_on")).toMatchObject({
@@ -559,6 +591,119 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
       minutes: 60,
     });
     expect(invalidPartyEnd.isError).toBe(true);
+  }).pipe(Effect.provide(TestLayer));
+});
+
+it.effect("keeps unproven speed-cap receipts pending", () => {
+  type ReceiptCase = {
+    readonly name: string;
+    readonly driveState: string;
+    readonly attributes: Record<string, unknown>;
+    readonly ageSeconds: number;
+  };
+  let receiptCase: ReceiptCase = {
+    name: "stale",
+    driveState: "True",
+    attributes: { mode: "poller-v3", pressure_cap_hz: 110, user_cap_hz: 110 },
+    ageSeconds: 31,
+  };
+  const CliLayer = Layer.succeed(
+    WatchmanHaCli.WatchmanHaCli,
+    WatchmanHaCli.WatchmanHaCli.of({
+      readWellRunHistory: () => Effect.die("unused"),
+      rest: (method) =>
+        method === "POST"
+          ? Effect.succeed([])
+          : DateTime.now.pipe(
+              Effect.map((now) => {
+                const observedAt = DateTime.formatIso(
+                  DateTime.add(now, { seconds: -receiptCase.ageSeconds }),
+                );
+                return [
+                  {
+                    ...state(
+                      "sensor.watchman_drive_snapshot",
+                      receiptCase.driveState,
+                      receiptCase.attributes,
+                    ),
+                    last_changed: observedAt,
+                    last_updated: observedAt,
+                  },
+                ];
+              }),
+            ),
+    }),
+  );
+  const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
+    Layer.provide(WatchmanToolkitHandlersLive),
+    Layer.provide(CliLayer),
+    Layer.provideMerge(McpServer.McpServer.layer),
+  );
+  const cases: ReadonlyArray<ReceiptCase> = [
+    receiptCase,
+    {
+      name: "missing physical cap",
+      driveState: "True",
+      attributes: { mode: "poller-v3", user_cap_hz: 110 },
+      ageSeconds: 0,
+    },
+    {
+      name: "null physical cap",
+      driveState: "True",
+      attributes: { mode: "poller-v3", pressure_cap_hz: null, user_cap_hz: 110 },
+      ageSeconds: 0,
+    },
+    {
+      name: "non-numeric physical cap",
+      driveState: "True",
+      attributes: { mode: "poller-v3", pressure_cap_hz: "110", user_cap_hz: 110 },
+      ageSeconds: 0,
+    },
+    {
+      name: "cap above requested ceiling",
+      driveState: "True",
+      attributes: { mode: "poller-v3", pressure_cap_hz: 110.01, user_cap_hz: 110 },
+      ageSeconds: 0,
+    },
+    {
+      name: "cap below safety floor",
+      driveState: "True",
+      attributes: { mode: "poller-v3", pressure_cap_hz: 101.99, user_cap_hz: 110 },
+      ageSeconds: 0,
+    },
+    {
+      name: "near but unmatched user ceiling",
+      driveState: "True",
+      attributes: { mode: "poller-v3", pressure_cap_hz: 109.99, user_cap_hz: 109.99 },
+      ageSeconds: 0,
+    },
+    {
+      name: "offline poller",
+      driveState: "False",
+      attributes: { mode: "poller-v3", pressure_cap_hz: 110, user_cap_hz: 110 },
+      ageSeconds: 0,
+    },
+  ];
+
+  return Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    for (const testCase of cases) {
+      receiptCase = testCase;
+      const result = yield* server
+        .callTool({
+          name: "watchman_water_control",
+          arguments: { operation: "set_speed_cap", max_hz: 110 },
+        })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+      expect(result.isError, testCase.name).toBe(false);
+      expect(result.structuredContent, testCase.name).toMatchObject({
+        accepted: true,
+        applied: "pending",
+      });
+    }
   }).pipe(Effect.provide(TestLayer));
 });
 
