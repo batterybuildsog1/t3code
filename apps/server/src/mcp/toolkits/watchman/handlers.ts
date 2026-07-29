@@ -715,50 +715,34 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
     | "show"
     | "scene"
     | "transport"
-    | "volume"
     | "power"
     | "hold"
     | "release"
     | "navigate"
     | "input_text";
   readonly screen: "a" | "b" | "c" | "d" | "all";
-  readonly url?: string | undefined;
   readonly app?: "netflix" | "youtube" | "disney_plus" | "prime_video" | "hulu" | undefined;
   readonly content_id?: string | undefined;
-  readonly title_query?: string | undefined;
-  readonly view?:
-    | "solar.primary"
-    | "water.flow"
-    | "water.day"
-    | "water.well"
-    | "water.duty"
-    | "site.events"
-    | "hvac.recroom"
-    | "water.runs"
-    | undefined;
+  readonly view?: "solar.primary" | "wall.dashboard" | undefined;
   readonly scene_name?: "party" | undefined;
   readonly members?: ReadonlyArray<"b" | "c" | "d"> | undefined;
-  readonly action?: "pause" | "resume" | "play_pause" | "next" | "prev" | "seek" | undefined;
-  readonly seek_s?: number | undefined;
+  readonly action?: "pause" | "resume" | "play_pause" | "next" | "prev" | undefined;
   readonly moves?:
     | ReadonlyArray<
         "up" | "down" | "left" | "right" | "select" | "back" | "home" | "search" | "play_pause"
       >
     | undefined;
   readonly text?: string | undefined;
-  readonly level?: number | undefined;
-  readonly muted?: boolean | undefined;
   readonly power?: "on" | "off" | undefined;
   readonly expires_at?: number | undefined;
 }) {
   const tool = "watchman_tv_control";
   yield* requireCapability(tool);
   const allowed = {
-    play: ["operation", "screen", "app", "content_id", "title_query"],
-    show: ["operation", "screen", "view", "url"],
+    play: ["operation", "screen", "app", "content_id"],
+    show: ["operation", "screen", "view"],
     scene: ["operation", "screen", "scene_name", "members"],
-    transport: ["operation", "screen", "action", "seek_s"],
-    volume: ["operation", "screen", "level", "muted"],
+    transport: ["operation", "screen", "action"],
     power: ["operation", "screen", "power"],
     hold: ["operation", "screen", "expires_at"],
     release: ["operation", "screen"],
@@ -772,46 +756,28 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
   const nowSeconds = nowMs / 1000;
   let payload: Record<string, unknown>;
   if (input.operation === "play") {
+    if (input.app === undefined || input.content_id === undefined) {
+      return yield* fail(tool, "controller", "play requires app and a caller-resolved content_id.");
+    }
+    payload = {
+      app: input.app,
+      content_id: input.content_id,
+    };
+  } else if (input.operation === "show") {
+    if (input.view === undefined) {
+      return yield* fail(tool, "controller", "show requires a canonical view.");
+    }
     if (
-      input.app === undefined ||
-      (input.content_id === undefined) === (input.title_query === undefined)
+      (input.screen === "a" && input.view !== "solar.primary") ||
+      (input.screen !== "a" && input.view !== "wall.dashboard")
     ) {
       return yield* fail(
         tool,
         "controller",
-        "play requires app and exactly one of content_id or title_query.",
+        "show requires solar.primary on TV A or wall.dashboard on TVs B-D.",
       );
     }
-    payload = {
-      app: input.app,
-      ...(input.content_id === undefined ? {} : { content_id: input.content_id }),
-      ...(input.title_query === undefined ? {} : { title_query: input.title_query }),
-    };
-  } else if (input.operation === "show") {
-    if ((input.view === undefined) === (input.url === undefined)) {
-      return yield* fail(tool, "controller", "show requires exactly one of view or url.");
-    }
-    if (input.url !== undefined) {
-      const rawUrl = input.url;
-      const url = yield* Effect.try({
-        try: () => new URL(rawUrl),
-        catch: () => fail(tool, "controller", "TV URL is invalid."),
-      });
-      if (
-        url.protocol !== "https:" ||
-        !url.hostname ||
-        url.username ||
-        url.password ||
-        Array.from(rawUrl).some((character) => character.codePointAt(0)! < 33)
-      ) {
-        return yield* fail(
-          tool,
-          "controller",
-          "TV URLs must use HTTPS, have a host, and contain no credentials or whitespace.",
-        );
-      }
-    }
-    payload = input.view === undefined ? { url: input.url } : { view: input.view };
+    payload = { view: input.view };
   } else if (input.operation === "scene") {
     if (input.scene_name === undefined) {
       return yield* fail(tool, "controller", "scene requires scene_name.");
@@ -835,25 +801,10 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
       ...(input.members === undefined ? {} : { members: input.members }),
     };
   } else if (input.operation === "transport") {
-    if (input.action === undefined || (input.action === "seek") !== (input.seek_s !== undefined)) {
-      return yield* fail(
-        tool,
-        "controller",
-        "transport requires action and seek_s exactly when action is seek.",
-      );
+    if (input.action === undefined) {
+      return yield* fail(tool, "controller", "transport requires action.");
     }
-    payload = {
-      action: input.action,
-      ...(input.seek_s === undefined ? {} : { seek_s: input.seek_s }),
-    };
-  } else if (input.operation === "volume") {
-    if (input.level === undefined && input.muted === undefined) {
-      return yield* fail(tool, "controller", "volume requires level or muted.");
-    }
-    payload = {
-      ...(input.level === undefined ? {} : { level: input.level }),
-      ...(input.muted === undefined ? {} : { muted: input.muted }),
-    };
+    payload = { action: input.action };
   } else if (input.operation === "power") {
     if (input.power === undefined) {
       return yield* fail(tool, "controller", "power requires power on or off.");
@@ -895,16 +846,11 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
   if (
     input.screen === "a" &&
     !(
-      input.operation === "volume" ||
       (input.operation === "power" && input.power === "on") ||
       (input.operation === "show" && input.view === "solar.primary")
     )
   ) {
-    return yield* fail(
-      tool,
-      "controller",
-      "TV A allows solar.primary restore, volume or mute, and power-on only.",
-    );
+    return yield* fail(tool, "controller", "TV A allows solar.primary restore and power-on only.");
   }
 
   const spool = yield* TvdSpool.TvdSpool;

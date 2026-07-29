@@ -563,7 +563,7 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
     const irrelevantTvField = yield* call("watchman_tv_control", {
       operation: "show",
       screen: "d",
-      url: "https://example.com",
+      view: "wall.dashboard",
       app: "netflix",
     });
     expect(irrelevantTvField.isError).toBe(true);
@@ -611,21 +611,49 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
     const tvA = yield* call("watchman_tv_control", {
       operation: "show",
       screen: "a",
-      url: "https://example.com/video",
+      view: "wall.dashboard",
     });
     expect(tvA.isError).toBe(true);
     expect(calls.filter(({ method }) => method === "POST")).toHaveLength(postsBeforeTvA);
 
-    const tvUrl = yield* call("watchman_tv_control", {
+    const tvDashboard = yield* call("watchman_tv_control", {
       operation: "show",
       screen: "d",
-      url: "https://example.com/video",
+      view: "wall.dashboard",
     });
-    expect(tvUrl.isError).toBe(false);
-    expect(tvUrl.structuredContent).toMatchObject({
+    expect(tvDashboard.isError).toBe(false);
+    expect(tvDashboard.structuredContent).toMatchObject({
       accepted: "accepted",
       applied: "verified",
     });
+
+    for (const unsupported of [
+      {
+        operation: "play",
+        screen: "d",
+        app: "youtube",
+        title_query: "Bluey",
+      },
+      {
+        operation: "show",
+        screen: "d",
+        url: "https://example.com/video",
+      },
+      {
+        operation: "transport",
+        screen: "d",
+        action: "seek",
+        seek_s: 30,
+      },
+      {
+        operation: "volume",
+        screen: "d",
+        muted: false,
+      },
+    ]) {
+      const result = yield* call("watchman_tv_control", unsupported);
+      expect(result.isError).toBe(true);
+    }
 
     const tvPower = yield* call("watchman_tv_control", {
       operation: "power",

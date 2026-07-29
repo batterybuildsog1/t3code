@@ -23,7 +23,6 @@ const tvParameters = Schema.Struct({
     "show",
     "scene",
     "transport",
-    "volume",
     "power",
     "hold",
     "release",
@@ -35,26 +34,7 @@ const tvParameters = Schema.Struct({
     Schema.Literals(["netflix", "youtube", "disney_plus", "prime_video", "hulu"]),
   ),
   content_id: Schema.optional(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(512))),
-  title_query: Schema.optional(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(120))),
-  view: Schema.optional(
-    Schema.Literals([
-      "solar.primary",
-      "water.flow",
-      "water.day",
-      "water.well",
-      "water.duty",
-      "site.events",
-      "hvac.recroom",
-      "water.runs",
-    ]),
-  ),
-  url: Schema.optional(
-    Schema.String.check(
-      Schema.isMinLength(1),
-      Schema.isMaxLength(2048),
-      Schema.isPattern(/^https:\/\//),
-    ),
-  ),
+  view: Schema.optional(Schema.Literals(["solar.primary", "wall.dashboard"])),
   scene_name: Schema.optional(Schema.Literal("party")),
   members: Schema.optional(
     Schema.Array(Schema.Literals(["b", "c", "d"])).check(
@@ -62,10 +42,7 @@ const tvParameters = Schema.Struct({
       Schema.isMaxLength(3),
     ),
   ),
-  action: Schema.optional(
-    Schema.Literals(["pause", "resume", "play_pause", "next", "prev", "seek"]),
-  ),
-  seek_s: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: -3600, maximum: 3600 }))),
+  action: Schema.optional(Schema.Literals(["pause", "resume", "play_pause", "next", "prev"])),
   moves: Schema.optional(
     Schema.Array(
       Schema.Literals([
@@ -88,8 +65,6 @@ const tvParameters = Schema.Struct({
       Schema.isPattern(/^[\x20-\x7e]+$/),
     ),
   ),
-  level: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 100 }))),
-  muted: Schema.optional(Schema.Boolean),
   power: Schema.optional(Schema.Literals(["on", "off"])),
   expires_at: Schema.optional(Schema.Finite),
 }).annotate(strictParameters);
@@ -177,7 +152,7 @@ export const WatchmanHistoryTool = readTool(
 export const WatchmanTvControlTool = mutationTool(
   Tool.make("watchman_tv_control", {
     description:
-      "File a typed request to the resident tvd controller and return its five-part requested/accepted/applied/observed/evidence receipt. Supported apps are Netflix, YouTube, Disney+, Prime Video, and Hulu. TV A is fail-closed to solar.primary restore, volume/mute, and power-on only; eligible 'all' requests target the flexible TVs B-D. Verification is honest: verified means tvd witnessed the verb-specific postcondition, while pending, unavailable, rejected, superseded, failed, or indeterminate must be reported unchanged.",
+      "File a typed request to the resident tvd controller and return its five-part requested/accepted/applied/observed/evidence receipt. Play requires a caller-resolved content_id. Show is limited to solar.primary on TV A or wall.dashboard on TVs B-D. Supported apps are Netflix, YouTube, Disney+, Prime Video, and Hulu. TV A is fail-closed to solar.primary restore and power-on only; eligible 'all' requests target the flexible TVs B-D. Volume, mute, seek, arbitrary URLs, and title resolution are unavailable until their execution and witness paths are proven. Verification is honest: verified means tvd witnessed the verb-specific postcondition, while pending, unavailable, rejected, superseded, failed, or indeterminate must be reported unchanged.",
     parameters: tvParameters,
     success: result,
     failure: WatchmanControlError,
