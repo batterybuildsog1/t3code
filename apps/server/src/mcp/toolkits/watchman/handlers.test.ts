@@ -131,7 +131,8 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
       evidence: "telemetry",
       arbitrary: oversizedHvacMetadata,
     }),
-    state("input_select.hvac_mode", "Auto"),
+    state("input_select.hvac_mode", "Off"),
+    state("input_datetime.hvac_party_until", "2026-07-28 16:45:08"),
     state("input_select.hvac_requested_pairs", "None"),
     state("input_number.hvac_party_setpoint_f", "74"),
     state("input_select.well_solar_operator_mode", "manual_hold"),
@@ -303,12 +304,13 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
       observed: {
         power: { battery_soc_pct: { state: "69.0" } },
         water: { pump_running: { state: "off" } },
-        hvac: { mode: { state: "Auto" } },
+        hvac: { mode: { state: "Off" } },
         operations: {
           last_site_event: {
             state: "event-1",
             attributes: { headline: "Well pump off" },
           },
+          party: { active: false },
         },
       },
     });
@@ -330,6 +332,49 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
     const encodedSiteStatus = yield* encodeJson(siteStatus.structuredContent);
     expect(encodedSiteStatus.length).toBeLessThan(2_400);
     expect(encodedSiteStatus).not.toContain("arbitrary");
+
+    const automation = yield* call("watchman_automation", {});
+    expect(automation.isError).toBe(false);
+    expect(automation.structuredContent).toMatchObject({
+      installed: {
+        hvac_mode: { state: "Off" },
+        party: { active: false },
+      },
+      mutable_jobs: [],
+    });
+    expect(automation.structuredContent).not.toHaveProperty("installed.party_until");
+    expect(automation.structuredContent).not.toHaveProperty("installed.party.until");
+    const encodedAutomation = yield* encodeJson(automation.structuredContent);
+    expect(encodedAutomation.length).toBeLessThan(1_600);
+    expect(encodedAutomation).not.toContain("arbitrary");
+
+    const hvacMode = states.find(({ entity_id }) => entity_id === "input_select.hvac_mode")!;
+    const partyUntil = states.find(
+      ({ entity_id }) => entity_id === "input_datetime.hvac_party_until",
+    )!;
+    hvacMode.state = "Party";
+    partyUntil.state = "2026-07-29 02:00:00";
+    const activeParty = yield* call("watchman_automation", {});
+    expect(activeParty.structuredContent).toMatchObject({
+      installed: {
+        party: {
+          active: true,
+          until: { state: "2026-07-29 02:00:00" },
+        },
+      },
+    });
+    hvacMode.state = "unavailable";
+    const unavailableParty = yield* call("watchman_automation", {});
+    expect(unavailableParty.structuredContent).toMatchObject({
+      installed: {
+        party: {
+          active: "unknown",
+          reason: "hvac_mode_unavailable",
+        },
+      },
+    });
+    expect(unavailableParty.structuredContent).not.toHaveProperty("installed.party.until");
+    hvacMode.state = "Off";
 
     const weatherStatus = yield* call("watchman_status", { area: "weather" });
     expect(weatherStatus.isError).toBe(false);

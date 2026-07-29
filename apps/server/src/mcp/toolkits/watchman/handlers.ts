@@ -201,6 +201,18 @@ const compactTvState = (states: ReadonlyMap<string, HaState>, entityId: string) 
   };
 };
 
+const compactHvacPartyState = (states: ReadonlyMap<string, HaState>) => {
+  const mode = states.get("input_select.hvac_mode");
+  if (!mode || ["unknown", "unavailable"].includes(mode.state.toLowerCase())) {
+    return { active: "unknown" as const, reason: "hvac_mode_unavailable" };
+  }
+  const active = mode.state === "Party";
+  return {
+    active,
+    ...(active ? { until: compactState(states, "input_datetime.hvac_party_until") } : {}),
+  };
+};
+
 const compactHvacControllerState = (states: ReadonlyMap<string, HaState>) => {
   const entity = states.get("sensor.watchman_hvac_controller");
   if (!entity) return { state: "unavailable", missing: true };
@@ -386,7 +398,7 @@ const statusForArea = (
       "evidence",
     ]),
     hvac_mode: compactState(states, "input_select.hvac_mode"),
-    party_until: compactState(states, "input_datetime.hvac_party_until"),
+    party: compactHvacPartyState(states),
     well_mode: compactState(states, "input_select.well_solar_operator_mode"),
     tv_night_shed: compactState(states, "input_boolean.tv_night_shed_active"),
   };
@@ -439,7 +451,7 @@ const status = Effect.fn("WatchmanToolkit.status")(function* (input: {
             "lifecycle",
             "headline",
           ]),
-          party_until: compactState(states, "input_datetime.hvac_party_until"),
+          party: compactHvacPartyState(states),
           well_mode: compactState(states, "input_select.well_solar_operator_mode"),
           tv_night_shed: compactState(states, "input_boolean.tv_night_shed_active"),
         },
