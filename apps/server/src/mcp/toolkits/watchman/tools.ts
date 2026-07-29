@@ -91,7 +91,7 @@ const readTool = <T extends Tool.Any>(tool: T): T =>
 export const WatchmanStatusTool = readTool(
   Tool.make("watchman_status", {
     description:
-      "Read curated live Watchman status for the site, power, water, HVAC, TVs, weather, or controller decisions. Values include evidence/source labels; never infer a number that is absent.",
+      "Read curated live Watchman status for the site, power, water, HVAC, TVs, weather, or controller decisions. Choose exactly the narrowest applicable area; never combine an area read with site. Power includes current control availability. Values include evidence/source labels; never infer a number that is absent.",
     parameters: Schema.Struct({
       area: Schema.Literals(["site", "power", "water", "hvac", "tv", "weather", "operations"]),
     }),
@@ -157,17 +157,6 @@ export const WatchmanWaterControlTool = mutationTool(
   }).annotate(Tool.Title, "Control Watchman water"),
 );
 
-export const WatchmanPowerControlTool = readTool(
-  Tool.make("watchman_power_control", {
-    description:
-      "Read the current power-control availability. Mutations are unavailable today: generator start is manual, and shutdown plus battery/generator safety settings are excluded from Control mode.",
-    parameters: noParameters,
-    success: result,
-    failure: WatchmanControlError,
-    dependencies,
-  }).annotate(Tool.Title, "Inspect Watchman power controls"),
-);
-
 export const WatchmanAutomationTool = readTool(
   Tool.make("watchman_automation", {
     description:
@@ -185,6 +174,5 @@ export const WatchmanToolkit = Toolkit.make(
   WatchmanTvControlTool,
   WatchmanHvacControlTool,
   WatchmanWaterControlTool,
-  WatchmanPowerControlTool,
   WatchmanAutomationTool,
 );

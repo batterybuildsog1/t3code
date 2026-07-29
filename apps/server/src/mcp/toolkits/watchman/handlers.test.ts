@@ -58,6 +58,79 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
   const oversizedTvMetadata = "x".repeat(50_000);
   const oversizedHvacMetadata = "y".repeat(50_000);
   const states = [
+    state("sensor.parallel_group_a_battery_state_of_charge", "69.0", {
+      unit_of_measurement: "%",
+      arbitrary: oversizedHvacMetadata,
+    }),
+    state("sensor.parallel_group_a_battery_power", "-5312.0", {
+      unit_of_measurement: "W",
+      arbitrary: oversizedHvacMetadata,
+    }),
+    state("sensor.parallel_group_a_pv_total_power", "215.0", {
+      unit_of_measurement: "W",
+      arbitrary: oversizedHvacMetadata,
+    }),
+    state("sensor.parallel_group_a_consumption_power", "5527.0", {
+      unit_of_measurement: "W",
+      arbitrary: oversizedHvacMetadata,
+    }),
+    state("binary_sensor.generator_running", "on", {
+      evidence: "inferred_not_measured",
+      arbitrary: oversizedHvacMetadata,
+    }),
+    state("sensor.hvac_reserve_target", "59.1", {
+      valid: true,
+      reason: "weather reserve model",
+      arbitrary: oversizedHvacMetadata,
+    }),
+    state("binary_sensor.well_pump_running", "off", {
+      arbitrary: oversizedHvacMetadata,
+    }),
+    state("sensor.well_pressure", "6.0", {
+      calibration: "CAL-20260709a",
+      source: "ID59",
+      arbitrary: oversizedHvacMetadata,
+    }),
+    state("sensor.well_flow_estimate", "0", {
+      arbitrary: oversizedHvacMetadata,
+    }),
+    state("sensor.well_rsi_output_frequency", "0.0", {
+      arbitrary: oversizedHvacMetadata,
+    }),
+    state("sensor.well_start_forecast", "11:45", {
+      start_local: "11:45",
+      spoken: "eleven forty five",
+      confidence: "uncertain",
+      reason: "heavy cloud could push it later",
+      phase: "FAULT",
+      arbitrary: oversizedHvacMetadata,
+    }),
+    state("weather.centennial", "cloudy", {
+      temperature: 21,
+      apparent_temperature: 20,
+      humidity: 45,
+      pressure: 1012,
+      wind_speed: 14,
+      wind_bearing: 220,
+      temperature_unit: "°C",
+      pressure_unit: "hPa",
+      wind_speed_unit: "km/h",
+      arbitrary: oversizedHvacMetadata,
+    }),
+    state("sensor.watchman_site_event", "event-1", {
+      occurred_at: "2026-07-28T22:23:42Z",
+      system: "well",
+      severity: "info",
+      lifecycle: "resolved",
+      headline: "Well pump off",
+      reason: "target reached",
+      impact: "none",
+      risk: "normal",
+      next_action: "",
+      actor: "well_monitor",
+      evidence: "telemetry",
+      arbitrary: oversizedHvacMetadata,
+    }),
     state("input_select.hvac_mode", "Auto"),
     state("input_select.hvac_requested_pairs", "None"),
     state("input_number.hvac_party_setpoint_f", "74"),
@@ -71,8 +144,17 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
       ctrl_error: null,
       ctrl_held: true,
       ctrl_command_age_s: 1,
+      arbitrary: oversizedHvacMetadata,
     }),
-    state("sensor.well_solar_controller", "HOLD", { safety_latch: null }),
+    state("sensor.well_solar_controller", "HOLD", {
+      requested_mode: "hold",
+      reason: "operator_hold",
+      armed: true,
+      operator_mode: "automatic",
+      fail_count: 0,
+      safety_latch: null,
+      arbitrary: oversizedHvacMetadata,
+    }),
     state("sensor.watchman_hvac_controller", "ready", {
       mode: "shadow",
       actuation_compiled_in: false,
@@ -154,7 +236,6 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
         "watchman_automation",
         "watchman_history",
         "watchman_hvac_control",
-        "watchman_power_control",
         "watchman_status",
         "watchman_tv_control",
         "watchman_water_control",
@@ -167,6 +248,106 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
     const status = yield* call("watchman_status", { area: "water" });
     expect(status.isError).toBe(false);
     expect(calls.at(-1)).toMatchObject({ method: "GET", path: "/api/states" });
+    expect(status.structuredContent).toMatchObject({
+      observed: {
+        pump_running: { state: "off" },
+        pressure_psi: {
+          state: "6.0",
+          attributes: { calibration: "CAL-20260709a", source: "ID59" },
+        },
+        drive_control: {
+          attributes: {
+            ctrl_requested_mode: "hold",
+            ctrl_applied_mode: "hold",
+            ctrl_ack: true,
+            ctrl_error: null,
+          },
+        },
+        expected_start: {
+          state: "11:45",
+          attributes: {
+            confidence: "uncertain",
+            reason: "heavy cloud could push it later",
+          },
+        },
+      },
+    });
+    const encodedWaterStatus = yield* encodeJson(status.structuredContent);
+    expect(encodedWaterStatus.length).toBeLessThan(2_000);
+    expect(encodedWaterStatus).not.toContain("arbitrary");
+    expect(encodedWaterStatus).not.toContain(oversizedHvacMetadata.slice(0, 100));
+
+    const powerStatus = yield* call("watchman_status", { area: "power" });
+    expect(powerStatus.isError).toBe(false);
+    expect(powerStatus.structuredContent).toMatchObject({
+      observed: {
+        control: {
+          available_mutations: [],
+          generator: "manual_until_two_wire_control_and_run_readback_exist",
+        },
+        battery_soc_pct: { state: "69.0" },
+        generator_running: { state: "on", evidence: "inferred_not_measured" },
+        reserve_model: {
+          state: "59.1",
+          attributes: { valid: true, reason: "weather reserve model" },
+        },
+      },
+    });
+    const encodedPowerStatus = yield* encodeJson(powerStatus.structuredContent);
+    expect(encodedPowerStatus.length).toBeLessThan(1_200);
+    expect(encodedPowerStatus).not.toContain("arbitrary");
+
+    const siteStatus = yield* call("watchman_status", { area: "site" });
+    expect(siteStatus.isError).toBe(false);
+    expect(siteStatus.structuredContent).toMatchObject({
+      observed: {
+        power: { battery_soc_pct: { state: "69.0" } },
+        water: { pump_running: { state: "off" } },
+        hvac: { mode: { state: "Auto" } },
+        operations: {
+          last_site_event: {
+            state: "event-1",
+            attributes: { headline: "Well pump off" },
+          },
+        },
+      },
+    });
+    const siteContent = siteStatus.structuredContent as {
+      readonly observed: {
+        readonly power: Record<string, unknown>;
+        readonly water: Record<string, unknown>;
+        readonly hvac: Record<string, unknown>;
+        readonly operations: {
+          readonly last_site_event: { readonly attributes: Record<string, unknown> };
+        };
+      };
+    };
+    expect(siteContent.observed.power).not.toHaveProperty("control");
+    expect(siteContent.observed.water).not.toHaveProperty("drive_control");
+    expect(siteContent.observed.hvac).not.toHaveProperty("direct_controller");
+    expect(siteContent.observed.operations.last_site_event.attributes).not.toHaveProperty("reason");
+    expect(siteContent.observed.operations.last_site_event.attributes).not.toHaveProperty("impact");
+    const encodedSiteStatus = yield* encodeJson(siteStatus.structuredContent);
+    expect(encodedSiteStatus.length).toBeLessThan(2_400);
+    expect(encodedSiteStatus).not.toContain("arbitrary");
+
+    const weatherStatus = yield* call("watchman_status", { area: "weather" });
+    expect(weatherStatus.isError).toBe(false);
+    expect(weatherStatus.structuredContent).toMatchObject({
+      observed: {
+        weather: {
+          state: "cloudy",
+          attributes: {
+            temperature: 21,
+            pressure: 1012,
+            wind_speed: 14,
+            temperature_unit: "°C",
+            pressure_unit: "hPa",
+            wind_speed_unit: "km/h",
+          },
+        },
+      },
+    });
 
     const tvStatus = yield* call("watchman_status", { area: "tv" });
     expect(tvStatus.isError).toBe(false);
@@ -333,12 +514,6 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
       minutes: 60,
     });
     expect(invalidPartyEnd.isError).toBe(true);
-
-    const postsBeforePower = calls.filter(({ method }) => method === "POST").length;
-    const power = yield* call("watchman_power_control", {});
-    expect(power.isError).toBe(false);
-    expect(calls.filter(({ method }) => method === "POST")).toHaveLength(postsBeforePower);
-    expect(power.structuredContent).toMatchObject({ available_mutations: [] });
   }).pipe(Effect.provide(TestLayer));
 });
 

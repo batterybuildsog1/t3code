@@ -14,7 +14,6 @@ type WatchmanToolName =
   | "watchman_tv_control"
   | "watchman_hvac_control"
   | "watchman_water_control"
-  | "watchman_power_control"
   | "watchman_automation";
 
 const HaState = Schema.Struct({
@@ -142,15 +141,31 @@ const service = (domain: string, name: string, data: Record<string, unknown>): S
   data,
 });
 
-const compactState = (states: ReadonlyMap<string, HaState>, entityId: string) => {
+const compactState = (
+  states: ReadonlyMap<string, HaState>,
+  entityId: string,
+  attributeNames: ReadonlyArray<string> = [],
+) => {
   const entity = states.get(entityId);
-  return entity
-    ? {
-        state: entity.state,
-        attributes: entity.attributes,
-        last_updated: entity.last_updated,
-      }
-    : { state: "unavailable", missing: true };
+  if (!entity) return { state: "unavailable", missing: true };
+  const selectedAttributes = Object.fromEntries(
+    attributeNames.flatMap((name) => {
+      const value = entity.attributes[name];
+      return value === null ||
+        typeof value === "boolean" ||
+        (typeof value === "number" && Number.isFinite(value)) ||
+        typeof value === "string"
+        ? [[name, typeof value === "string" ? value.slice(0, 160) : value]]
+        : [];
+    }),
+  );
+  return {
+    state: entity.state.slice(0, 120),
+    ...(Object.keys(selectedAttributes).length === 0 ? {} : { attributes: selectedAttributes }),
+    ...(entity.last_updated === undefined
+      ? {}
+      : { last_updated: entity.last_updated.slice(0, 64) }),
+  };
 };
 
 const compactTvState = (states: ReadonlyMap<string, HaState>, entityId: string) => {
@@ -233,6 +248,11 @@ const statusForArea = (
 ): Record<string, unknown> => {
   if (area === "power") {
     return {
+      control: {
+        available_mutations: [],
+        generator: "manual_until_two_wire_control_and_run_readback_exist",
+        excluded: ["shutdown", "battery_settings", "generator_settings"],
+      },
       battery_soc_pct: compactState(states, "sensor.parallel_group_a_battery_state_of_charge"),
       battery_power_w_negative_is_charging: compactState(
         states,
@@ -242,29 +262,56 @@ const statusForArea = (
       site_load_w: compactState(states, "sensor.parallel_group_a_consumption_power"),
       generator_running: {
         ...compactState(states, "binary_sensor.generator_running"),
-        evidence: "inferred",
+        evidence: "inferred_not_measured",
       },
-      reserve_model: compactState(states, "sensor.hvac_reserve_target"),
+      reserve_model: compactState(states, "sensor.hvac_reserve_target", ["valid", "reason"]),
     };
   }
   if (area === "water") {
     return {
       pump_running: compactState(states, "binary_sensor.well_pump_running"),
-      pressure_psi: compactState(states, "sensor.well_pressure"),
+      pressure_psi: compactState(states, "sensor.well_pressure", ["calibration", "source"]),
       flow_gpm: {
         ...compactState(states, "sensor.well_flow_estimate"),
         evidence: "estimated",
       },
       drive_hz: compactState(states, "sensor.well_rsi_output_frequency"),
       user_speed_cap_hz: compactState(states, "input_number.well_user_max_hz"),
-      controller: compactState(states, "sensor.well_solar_controller"),
-      drive_control: compactState(states, "sensor.watchman_drive_snapshot"),
-      expected_start: compactState(states, "sensor.well_start_forecast"),
-      tanks: { state: "unavailable", reason: "No installed tank telemetry/control surface." },
-      reverse_osmosis: {
-        state: "unavailable",
-        reason: "No installed RO telemetry/control surface.",
-      },
+      controller: compactState(states, "sensor.well_solar_controller", [
+        "requested_mode",
+        "reason",
+        "armed",
+        "operator_mode",
+        "fail_count",
+        "safety_latch",
+      ]),
+      drive_control: compactState(states, "sensor.watchman_drive_snapshot", [
+        "mode",
+        "run",
+        "freq_hz",
+        "dc_v",
+        "fault_bit",
+        "alarm_bit",
+        "fault_code",
+        "alarm_code",
+        "ctrl_requested_mode",
+        "ctrl_applied_mode",
+        "ctrl_reason",
+        "ctrl_armed",
+        "ctrl_held",
+        "ctrl_ack",
+        "ctrl_error",
+        "ctrl_command_age_s",
+        "ctrl_lease_remaining_s",
+      ]),
+      expected_start: compactState(states, "sensor.well_start_forecast", [
+        "start_local",
+        "spoken",
+        "confidence",
+        "reason",
+        "phase",
+      ]),
+      uninstalled: ["tank_telemetry", "reverse_osmosis_telemetry"],
     };
   }
   if (area === "hvac") {
@@ -276,7 +323,12 @@ const statusForArea = (
       controller_reason: compactState(states, "sensor.hvac_controller_reason"),
       direct_controller: compactHvacControllerState(states),
       inverter_hall: {
-        ...compactState(states, "climate.hvac_inverter_hall"),
+        ...compactState(states, "climate.hvac_inverter_hall", [
+          "current_temperature",
+          "temperature",
+          "fan_mode",
+          "hvac_action",
+        ]),
         evidence: "cloud_reported",
       },
     };
@@ -295,12 +347,34 @@ const statusForArea = (
   }
   if (area === "weather") {
     return {
-      weather: compactState(states, "weather.centennial"),
-      sun: compactState(states, "sun.sun"),
+      weather: compactState(states, "weather.centennial", [
+        "temperature",
+        "apparent_temperature",
+        "humidity",
+        "pressure",
+        "wind_speed",
+        "wind_bearing",
+        "temperature_unit",
+        "pressure_unit",
+        "wind_speed_unit",
+      ]),
+      sun: compactState(states, "sun.sun", ["next_rising", "next_setting", "elevation", "rising"]),
     };
   }
   return {
-    last_site_event: compactState(states, "sensor.watchman_site_event"),
+    last_site_event: compactState(states, "sensor.watchman_site_event", [
+      "occurred_at",
+      "system",
+      "severity",
+      "lifecycle",
+      "headline",
+      "reason",
+      "impact",
+      "risk",
+      "next_action",
+      "actor",
+      "evidence",
+    ]),
     hvac_mode: compactState(states, "input_select.hvac_mode"),
     party_until: compactState(states, "input_datetime.hvac_party_until"),
     well_mode: compactState(states, "input_select.well_solar_operator_mode"),
@@ -317,10 +391,49 @@ const status = Effect.fn("WatchmanToolkit.status")(function* (input: {
   if (input.area === "site") {
     return {
       source: "Home Assistant live state",
-      power: statusForArea(states, "power"),
-      water: statusForArea(states, "water"),
-      hvac: statusForArea(states, "hvac"),
-      operations: statusForArea(states, "operations"),
+      observed: {
+        power: {
+          battery_soc_pct: compactState(states, "sensor.parallel_group_a_battery_state_of_charge"),
+          solar_w: compactState(states, "sensor.parallel_group_a_pv_total_power"),
+          site_load_w: compactState(states, "sensor.parallel_group_a_consumption_power"),
+          generator_running: {
+            ...compactState(states, "binary_sensor.generator_running"),
+            evidence: "inferred_not_measured",
+          },
+        },
+        water: {
+          pump_running: compactState(states, "binary_sensor.well_pump_running"),
+          pressure_psi: compactState(states, "sensor.well_pressure"),
+          drive_hz: compactState(states, "sensor.well_rsi_output_frequency"),
+          controller: compactState(states, "sensor.well_solar_controller", [
+            "reason",
+            "operator_mode",
+            "safety_latch",
+          ]),
+          expected_start: compactState(states, "sensor.well_start_forecast", [
+            "confidence",
+            "reason",
+          ]),
+        },
+        hvac: {
+          mode: compactState(states, "input_select.hvac_mode"),
+          target_f: compactState(states, "input_number.hvac_party_setpoint_f"),
+          guard_cap: compactState(states, "sensor.hvac_guard_cap"),
+          controller_reason: compactState(states, "sensor.hvac_controller_reason"),
+        },
+        operations: {
+          last_site_event: compactState(states, "sensor.watchman_site_event", [
+            "occurred_at",
+            "system",
+            "severity",
+            "lifecycle",
+            "headline",
+          ]),
+          party_until: compactState(states, "input_datetime.hvac_party_until"),
+          well_mode: compactState(states, "input_select.well_solar_operator_mode"),
+          tv_night_shed: compactState(states, "input_boolean.tv_night_shed_active"),
+        },
+      },
     };
   }
   return {
@@ -1037,22 +1150,6 @@ const waterControl = Effect.fn("WatchmanToolkit.waterControl")(function* (input:
   });
 });
 
-const powerControl = Effect.fn("WatchmanToolkit.powerControl")(function* () {
-  const tool = "watchman_power_control";
-  yield* requireCapability(tool);
-  const states = yield* readStates(tool);
-  return {
-    available_mutations: [],
-    unavailable: {
-      generator:
-        "Manual today; enable only after a deterministic two-wire controller and run readback exist.",
-      shutdown: "Excluded from Control mode.",
-      battery_and_generator_settings: "Excluded safety settings.",
-    },
-    observed: statusForArea(states, "power"),
-  };
-});
-
 const automation = Effect.fn("WatchmanToolkit.automation")(function* () {
   const tool = "watchman_automation";
   yield* requireCapability(tool);
@@ -1071,7 +1168,6 @@ const handlers = {
   watchman_tv_control: (input) => mutationSemaphore.withPermits(1)(tvControl(input)),
   watchman_hvac_control: (input) => mutationSemaphore.withPermits(1)(hvacControl(input)),
   watchman_water_control: (input) => mutationSemaphore.withPermits(1)(waterControl(input)),
-  watchman_power_control: powerControl,
   watchman_automation: automation,
 } satisfies Parameters<typeof WatchmanToolkit.toLayer>[0];
 
