@@ -710,16 +710,7 @@ const mutationResult = (input: {
 });
 
 const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
-  readonly operation:
-    | "play"
-    | "show"
-    | "scene"
-    | "transport"
-    | "power"
-    | "hold"
-    | "release"
-    | "navigate"
-    | "input_text";
+  readonly operation: "play" | "show" | "scene" | "transport" | "power" | "hold" | "release";
   readonly screen: "a" | "b" | "c" | "d" | "all";
   readonly app?: "netflix" | "youtube" | "disney_plus" | "prime_video" | "hulu" | undefined;
   readonly content_id?: string | undefined;
@@ -727,12 +718,6 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
   readonly scene_name?: "party" | undefined;
   readonly members?: ReadonlyArray<"b" | "c" | "d"> | undefined;
   readonly action?: "pause" | "resume" | "play_pause" | "next" | "prev" | undefined;
-  readonly moves?:
-    | ReadonlyArray<
-        "up" | "down" | "left" | "right" | "select" | "back" | "home" | "search" | "play_pause"
-      >
-    | undefined;
-  readonly text?: string | undefined;
   readonly power?: "on" | "off" | undefined;
   readonly expires_at?: number | undefined;
 }) {
@@ -746,8 +731,6 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
     power: ["operation", "screen", "power"],
     hold: ["operation", "screen", "expires_at"],
     release: ["operation", "screen"],
-    navigate: ["operation", "screen", "moves"],
-    input_text: ["operation", "screen", "text"],
   }[input.operation];
   const irrelevant = irrelevantParameter(tool, input, allowed);
   if (irrelevant) return yield* irrelevant;
@@ -823,24 +806,11 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
       );
     }
     payload = { expires_at: input.expires_at };
-  } else if (input.operation === "release") {
-    payload = {};
-  } else if (input.operation === "navigate") {
-    if (!input.moves?.length) {
-      return yield* fail(tool, "controller", "navigate requires moves.");
-    }
-    payload = { moves: input.moves };
   } else {
-    if (input.text === undefined) {
-      return yield* fail(tool, "controller", "input_text requires text.");
-    }
-    payload = { text: input.text };
+    payload = {};
   }
 
-  if (
-    input.screen === "all" &&
-    ["transport", "hold", "navigate", "input_text"].includes(input.operation)
-  ) {
+  if (input.screen === "all" && ["transport", "hold"].includes(input.operation)) {
     return yield* fail(tool, "controller", `${input.operation} targets exactly one screen.`);
   }
   if (

@@ -18,17 +18,7 @@ const noParameters = Schema.Record(Schema.String, Schema.Never);
 const strictParameters = { parseOptions: { onExcessProperty: "error" } } as const;
 
 const tvParameters = Schema.Struct({
-  operation: Schema.Literals([
-    "play",
-    "show",
-    "scene",
-    "transport",
-    "power",
-    "hold",
-    "release",
-    "navigate",
-    "input_text",
-  ]),
+  operation: Schema.Literals(["play", "show", "scene", "transport", "power", "hold", "release"]),
   screen,
   app: Schema.optional(
     Schema.Literals(["netflix", "youtube", "disney_plus", "prime_video", "hulu"]),
@@ -43,28 +33,6 @@ const tvParameters = Schema.Struct({
     ),
   ),
   action: Schema.optional(Schema.Literals(["pause", "resume", "play_pause", "next", "prev"])),
-  moves: Schema.optional(
-    Schema.Array(
-      Schema.Literals([
-        "up",
-        "down",
-        "left",
-        "right",
-        "select",
-        "back",
-        "home",
-        "search",
-        "play_pause",
-      ]),
-    ).check(Schema.isMinLength(1), Schema.isMaxLength(12)),
-  ),
-  text: Schema.optional(
-    Schema.String.check(
-      Schema.isMinLength(1),
-      Schema.isMaxLength(120),
-      Schema.isPattern(/^[\x20-\x7e]+$/),
-    ),
-  ),
   power: Schema.optional(Schema.Literals(["on", "off"])),
   expires_at: Schema.optional(Schema.Finite),
 }).annotate(strictParameters);
@@ -152,7 +120,7 @@ export const WatchmanHistoryTool = readTool(
 export const WatchmanTvControlTool = mutationTool(
   Tool.make("watchman_tv_control", {
     description:
-      "File a typed request to the resident tvd controller and return its five-part requested/accepted/applied/observed/evidence receipt. Play requires a caller-resolved content_id. Show is limited to solar.primary on TV A or wall.dashboard on TVs B-D. Supported apps are Netflix, YouTube, Disney+, Prime Video, and Hulu. TV A is fail-closed to solar.primary restore and power-on only; eligible 'all' requests target the flexible TVs B-D. Volume, mute, seek, arbitrary URLs, and title resolution are unavailable until their execution and witness paths are proven. Verification is honest: verified means tvd witnessed the verb-specific postcondition, while pending, unavailable, rejected, superseded, failed, or indeterminate must be reported unchanged.",
+      "File a typed request to the resident tvd controller and return its five-part requested/accepted/applied/observed/evidence receipt. Play requires a caller-resolved content_id. Show is limited to solar.primary on TV A or wall.dashboard on TVs B-D. Supported apps are Netflix, YouTube, Disney+, Prime Video, and Hulu. TV A is fail-closed to solar.primary restore and power-on only; eligible 'all' requests target the flexible TVs B-D. Volume, mute, seek, arbitrary URLs, title resolution, generic key navigation, and text entry are unavailable until their execution and witness paths are proven. Account/profile/subscription screens require attended commissioning and are never automated through this tool. Verification is honest: verified means tvd witnessed the verb-specific postcondition, while pending, unavailable, rejected, superseded, failed, or indeterminate must be reported unchanged.",
     parameters: tvParameters,
     success: result,
     failure: WatchmanControlError,

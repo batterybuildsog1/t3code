@@ -650,6 +650,16 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
         screen: "d",
         muted: false,
       },
+      {
+        operation: "navigate",
+        screen: "d",
+        moves: ["select"],
+      },
+      {
+        operation: "input_text",
+        screen: "d",
+        text: "provider secret",
+      },
     ]) {
       const result = yield* call("watchman_tv_control", unsupported);
       expect(result.isError).toBe(true);
