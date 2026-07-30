@@ -710,9 +710,19 @@ const mutationResult = (input: {
 });
 
 const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
-  readonly operation: "play" | "show" | "scene" | "transport" | "power" | "hold" | "release";
+  readonly operation:
+    | "play"
+    | "show"
+    | "scene"
+    | "transport"
+    | "power"
+    | "hold"
+    | "release"
+    | "play_title"
+    | "recover";
   readonly screen: "a" | "b" | "c" | "d" | "all";
   readonly app?: "netflix" | "youtube" | "disney_plus" | "prime_video" | "hulu" | undefined;
+  readonly title?: string | undefined;
   readonly content_id?: string | undefined;
   readonly view?: "solar.primary" | "wall.dashboard" | undefined;
   readonly scene_name?: "party" | undefined;
@@ -731,6 +741,8 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
     power: ["operation", "screen", "power"],
     hold: ["operation", "screen", "expires_at"],
     release: ["operation", "screen"],
+    play_title: ["operation", "screen", "title", "app"],
+    recover: ["operation", "screen", "app"],
   }[input.operation];
   const irrelevant = irrelevantParameter(tool, input, allowed);
   if (irrelevant) return yield* irrelevant;
@@ -745,6 +757,14 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
     payload = {
       app: input.app,
       content_id: input.content_id,
+    };
+  } else if (input.operation === "play_title") {
+    if (input.title === undefined) {
+      return yield* fail(tool, "controller", "play_title requires title.");
+    }
+    payload = {
+      title: input.title,
+      ...(input.app === undefined ? {} : { app: input.app }),
     };
   } else if (input.operation === "show") {
     if (input.view === undefined) {
@@ -785,8 +805,30 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
       );
     }
     payload = { expires_at: input.expires_at };
+  } else if (input.operation === "recover") {
+    if (input.app === undefined) {
+      return yield* fail(tool, "controller", "recover requires app.");
+    }
+    payload = { app: input.app };
   } else {
     payload = {};
+  }
+
+  if (
+    (input.operation === "play_title" || input.operation === "recover") &&
+    (input.app === "netflix" || input.app === "hulu")
+  ) {
+    return yield* fail(
+      tool,
+      "controller",
+      "Netflix and Hulu title play and recovery are pending an owner ruling.",
+    );
+  }
+  if (
+    input.screen === "all" &&
+    (input.operation === "play_title" || input.operation === "recover")
+  ) {
+    return yield* fail(tool, "controller", `${input.operation} targets exactly one screen.`);
   }
 
   const spool = yield* TvdSpool.TvdSpool;
@@ -847,7 +889,13 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
   yield* tvdController(tool, mutationSemaphore.withPermits(1)(spool.fileRequest(request)));
 
   const pollStartedMs = DateTime.toEpochMillis(yield* DateTime.now);
-  const deadlineMs = pollStartedMs + spool.receiptPollBudgetMs;
+  const receiptPollBudgetMs =
+    input.operation === "recover"
+      ? 45_000
+      : input.operation === "play_title"
+        ? 40_000
+        : spool.receiptPollBudgetMs;
+  const deadlineMs = pollStartedMs + receiptPollBudgetMs;
   while (true) {
     const receiptResult = yield* Effect.result(spool.readReceipt(requestId));
     if (Result.isSuccess(receiptResult)) return receiptResult.success;

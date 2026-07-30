@@ -18,11 +18,22 @@ const noParameters = Schema.Record(Schema.String, Schema.Never);
 const strictParameters = { parseOptions: { onExcessProperty: "error" } } as const;
 
 const tvParameters = Schema.Struct({
-  operation: Schema.Literals(["play", "show", "scene", "transport", "power", "hold", "release"]),
+  operation: Schema.Literals([
+    "play",
+    "show",
+    "scene",
+    "transport",
+    "power",
+    "hold",
+    "release",
+    "play_title",
+    "recover",
+  ]),
   screen,
   app: Schema.optional(
     Schema.Literals(["netflix", "youtube", "disney_plus", "prime_video", "hulu"]),
   ),
+  title: Schema.optional(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(120))),
   content_id: Schema.optional(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(512))),
   view: Schema.optional(Schema.Literals(["solar.primary", "wall.dashboard"])),
   scene_name: Schema.optional(Schema.Literal("party")),
@@ -120,7 +131,7 @@ export const WatchmanHistoryTool = readTool(
 export const WatchmanTvControlTool = mutationTool(
   Tool.make("watchman_tv_control", {
     description:
-      "File a typed request to the resident tvd controller and return its five-part requested/accepted/applied/observed/evidence receipt. Play requires a caller-resolved content_id. Show is limited to solar.primary on TV A or wall.dashboard on TVs B-D. Supported apps are Netflix, YouTube, Disney+, Prime Video, and Hulu. TV A is dual-purpose: it accepts play, transport, hold, release, canonical solar restore, and power-on, but rejects requested power-off and scene membership. An eligible 'all' request targets B-D except power-on, which targets A-D. Volume, mute, seek, arbitrary URLs, title resolution, generic key navigation, and text entry are unavailable until their execution and witness paths are proven. Account/profile/subscription screens require attended commissioning and are never automated through this tool. Verification is honest: verified means tvd witnessed the verb-specific postcondition, while pending, unavailable, rejected, superseded, failed, or indeterminate must be reported unchanged.",
+      "File typed TV requests to tvd and return its five-part receipt. Supports content-ID or title-based play with cross-platform resolution, canonical views/scenes, transport, power, holds/releases, and single-screen wall recovery. TV A is dual-purpose. Netflix/Hulu title play and recovery await an owner ruling; report tvd's applied state unchanged.",
     parameters: tvParameters,
     success: result,
     failure: WatchmanControlError,

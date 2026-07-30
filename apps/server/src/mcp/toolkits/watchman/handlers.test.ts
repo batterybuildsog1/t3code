@@ -2,6 +2,7 @@ import { expect, it } from "@effect/vitest";
 import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -1274,6 +1275,157 @@ it.effect("files exact tvd requests and passes daemon receipts through unchanged
   }).pipe(Effect.provide(TestLayer));
 });
 
+it.effect("files exact play_title requests with optional app and returns the receipt", () => {
+  const filed: Array<TvdSpool.TvdRequest> = [];
+  const CliLayer = Layer.succeed(
+    WatchmanHaCli.WatchmanHaCli,
+    WatchmanHaCli.WatchmanHaCli.of({
+      readWellRunHistory: () => Effect.die("unused"),
+      rest: () => Effect.die("TV control must not call Home Assistant"),
+    }),
+  );
+  const TvdLayer = makeTvdLayer({
+    fileRequest: (request) =>
+      Effect.sync(() => {
+        filed.push(request);
+      }),
+    readReceipt: (id) => {
+      const request = filed.at(-1)!;
+      return Effect.succeed({
+        requested: { request_id: id, intent: request.intent, screen: request.screen },
+        accepted: "accepted",
+        applied: "verified",
+        observed: { screens: { [request.screen]: { state: "claimed" } } },
+        evidence: "title identity and playback were witnessed",
+      });
+    },
+  });
+  const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
+    Layer.provide(WatchmanToolkitHandlersLive),
+    Layer.provide(CliLayer),
+    Layer.provide(TvdLayer),
+    Layer.provide(TestCryptoLayer),
+    Layer.provideMerge(McpServer.McpServer.layer),
+  );
+
+  return Effect.gen(function* () {
+    yield* TestClock.setTime(1_000_000_000);
+    const server = yield* McpServer.McpServer;
+    const call = (arguments_: Record<string, unknown>) =>
+      server
+        .callTool({ name: "watchman_tv_control", arguments: arguments_ })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+
+    const resolved = yield* call({
+      operation: "play_title",
+      screen: "d",
+      title: "Bluey",
+    });
+    expect(resolved.isError).toBe(false);
+    expect(resolved.structuredContent).toMatchObject({
+      requested: {
+        request_id: filed[0]!.request_id,
+        intent: "play_title",
+        screen: "d",
+      },
+      accepted: "accepted",
+      applied: "verified",
+    });
+    expect(yield* encodeJson(filed[0]!)).toBe(
+      `{"schema":1,"request_id":"${filed[0]!.request_id}","source":"t3","screen":"d","intent":"play_title","payload":{"title":"Bluey"},"issued_at":1000000,"ttl_s":120}`,
+    );
+
+    const hinted = yield* call({
+      operation: "play_title",
+      screen: "c",
+      title: "Andor",
+      app: "disney_plus",
+    });
+    expect(hinted.isError).toBe(false);
+    expect(hinted.structuredContent).toMatchObject({
+      requested: {
+        request_id: filed[1]!.request_id,
+        intent: "play_title",
+        screen: "c",
+      },
+      accepted: "accepted",
+      applied: "verified",
+    });
+    expect(yield* encodeJson(filed[1]!)).toBe(
+      `{"schema":1,"request_id":"${filed[1]!.request_id}","source":"t3","screen":"c","intent":"play_title","payload":{"title":"Andor","app":"disney_plus"},"issued_at":1000000,"ttl_s":120}`,
+    );
+  }).pipe(Effect.provide(TestLayer));
+});
+
+it.effect("rejects invalid title play and recovery requests before filing", () => {
+  const filed: Array<TvdSpool.TvdRequest> = [];
+  const CliLayer = Layer.succeed(
+    WatchmanHaCli.WatchmanHaCli,
+    WatchmanHaCli.WatchmanHaCli.of({
+      readWellRunHistory: () => Effect.die("unused"),
+      rest: () => Effect.die("TV control must not call Home Assistant"),
+    }),
+  );
+  const TvdLayer = makeTvdLayer({
+    fileRequest: (request) =>
+      Effect.sync(() => {
+        filed.push(request);
+      }),
+  });
+  const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
+    Layer.provide(WatchmanToolkitHandlersLive),
+    Layer.provide(CliLayer),
+    Layer.provide(TvdLayer),
+    Layer.provide(TestCryptoLayer),
+    Layer.provideMerge(McpServer.McpServer.layer),
+  );
+
+  return Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const call = (arguments_: Record<string, unknown>) =>
+      server
+        .callTool({ name: "watchman_tv_control", arguments: arguments_ })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+
+    for (const arguments_ of [
+      { operation: "play_title", screen: "all", title: "Bluey" },
+      { operation: "recover", screen: "all", app: "youtube" },
+    ]) {
+      expect((yield* call(arguments_)).isError).toBe(true);
+      expect(filed).toHaveLength(0);
+    }
+
+    expect((yield* call({ operation: "play_title", screen: "d" })).isError).toBe(true);
+    expect((yield* call({ operation: "recover", screen: "d" })).isError).toBe(true);
+    expect(filed).toHaveLength(0);
+
+    for (const app of ["netflix", "hulu"] as const) {
+      expect(
+        (yield* call({
+          operation: "play_title",
+          screen: "d",
+          title: "Bluey",
+          app,
+        })).isError,
+      ).toBe(true);
+      expect(
+        (yield* call({
+          operation: "recover",
+          screen: "d",
+          app,
+        })).isError,
+      ).toBe(true);
+      expect(filed).toHaveLength(0);
+    }
+  }).pipe(Effect.provide(TestLayer));
+});
+
 it.effect("returns pending after the receipt budget and names the durable receipt path", () => {
   const filed: Array<TvdSpool.TvdRequest> = [];
   let receiptPolls = 0;
@@ -1331,6 +1483,93 @@ it.effect("returns pending after the receipt budget and names the durable receip
     });
     expect(pending.structuredContent?.evidence).toContain(`request_id ${requestId}`);
     expect(pending.structuredContent?.evidence).toContain(`tv_receipts/${requestId}.json`);
+  }).pipe(Effect.provide(TestLayer));
+});
+
+it.effect("returns pending when receipts arrive after the title and recovery budgets", () => {
+  const filed: Array<TvdSpool.TvdRequest> = [];
+  const availableAt = new Map<string, number>();
+  const CliLayer = Layer.succeed(
+    WatchmanHaCli.WatchmanHaCli,
+    WatchmanHaCli.WatchmanHaCli.of({
+      readWellRunHistory: () => Effect.die("unused"),
+      rest: () => Effect.die("TV control must not call Home Assistant"),
+    }),
+  );
+  const readReceipt: TvdSpool.TvdSpool["Service"]["readReceipt"] = (id) =>
+    DateTime.now.pipe(
+      Effect.flatMap((now) =>
+        DateTime.toEpochMillis(now) < availableAt.get(id)!
+          ? tvdNotFound("read TV receipt")
+          : Effect.succeed({
+              requested: { request_id: id },
+              accepted: "accepted",
+              applied: "verified",
+              observed: { request_id: id },
+              evidence: "late terminal receipt",
+            }),
+      ),
+    );
+  const TvdLayer = makeTvdLayer({
+    fileRequest: (request) =>
+      Effect.sync(() => {
+        filed.push(request);
+        availableAt.set(
+          request.request_id,
+          request.issued_at * 1000 + (request.intent === "recover" ? 45_001 : 40_001),
+        );
+      }),
+    readReceipt,
+    receiptPollIntervalMs: 10_000,
+    receiptPollBudgetMs: 3,
+  });
+  const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
+    Layer.provide(WatchmanToolkitHandlersLive),
+    Layer.provide(CliLayer),
+    Layer.provide(TvdLayer),
+    Layer.provide(TestCryptoLayer),
+    Layer.provideMerge(McpServer.McpServer.layer),
+  );
+
+  return Effect.gen(function* () {
+    yield* TestClock.setTime(1_000_000_000);
+    const server = yield* McpServer.McpServer;
+    const call = (arguments_: Record<string, unknown>) =>
+      server
+        .callTool({ name: "watchman_tv_control", arguments: arguments_ })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+
+    for (const { arguments_, budget } of [
+      {
+        arguments_: { operation: "play_title", screen: "d", title: "Bluey" },
+        budget: 40_000,
+      },
+      {
+        arguments_: { operation: "recover", screen: "d", app: "disney_plus" },
+        budget: 45_000,
+      },
+    ]) {
+      const pendingFiber = yield* Effect.forkChild(call(arguments_));
+      yield* TestClock.adjust(Duration.millis(budget));
+      const pending = yield* Fiber.join(pendingFiber);
+      const requestId = filed.at(-1)!.request_id;
+      expect(pending.isError).toBe(false);
+      expect(pending.structuredContent).toMatchObject({
+        requested: { request_id: requestId },
+        accepted: "filed",
+        applied: "pending",
+        observed: { request_id: requestId },
+      });
+
+      yield* TestClock.adjust("1 millis");
+      expect(yield* readReceipt(requestId)).toMatchObject({
+        requested: { request_id: requestId },
+        applied: "verified",
+      });
+    }
   }).pipe(Effect.provide(TestLayer));
 });
 
@@ -1442,11 +1681,21 @@ it.effect("lets tvd own policy and blocks stale health or file collisions", () =
         operation: "release",
         screen: "a",
       },
+      {
+        operation: "play_title",
+        screen: "a",
+        title: "Bluey",
+      },
+      {
+        operation: "recover",
+        screen: "a",
+        app: "disney_plus",
+      },
     ]) {
       expect((yield* call(arguments_)).isError).toBe(false);
     }
     expect(
-      filed.slice(-5).map(({ screen, intent, payload }) => ({
+      filed.slice(-7).map(({ screen, intent, payload }) => ({
         screen,
         intent,
         payload,
@@ -1476,6 +1725,16 @@ it.effect("lets tvd own policy and blocks stale health or file collisions", () =
         screen: "a",
         intent: "release",
         payload: {},
+      },
+      {
+        screen: "a",
+        intent: "play_title",
+        payload: { title: "Bluey" },
+      },
+      {
+        screen: "a",
+        intent: "recover",
+        payload: { app: "disney_plus" },
       },
     ]);
     const filedBeforeUnavailable = filed.length;
