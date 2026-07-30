@@ -1517,6 +1517,25 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
             NULL
           ),
           (
+            'thread-stale-active',
+            'project-1',
+            'Stale active turn',
+            '{"provider":"codex","model":"gpt-5-codex"}',
+            'full-access',
+            'default',
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            0,
+            0,
+            0,
+            '2026-04-02T00:00:02.000Z',
+            '2026-04-02T00:00:03.000Z',
+            NULL,
+            NULL
+          ),
+          (
             'thread-deleted',
             'project-1',
             'Deleted thread',
@@ -1667,18 +1686,55 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           last_error,
           updated_at
         )
-        VALUES (
-          'thread-archived',
-          'running',
-          'opencode',
-          'opencode',
-          'provider-session-archived',
-          'provider-thread-archived',
-          'auto-accept-edits',
-          'turn-archived',
-          'earlier failure',
-          '2026-04-02T00:00:13.000Z'
-        )
+        VALUES
+          (
+            'thread-archived',
+            'running',
+            'opencode',
+            'opencode',
+            'provider-session-archived',
+            'provider-thread-archived',
+            'auto-accept-edits',
+            'turn-archived',
+            'earlier failure',
+            '2026-04-02T00:00:13.000Z'
+          ),
+          (
+            'thread-stale-active',
+            'stopped',
+            'opencode',
+            'opencode',
+            NULL,
+            NULL,
+            'full-access',
+            'turn-already-interrupted',
+            NULL,
+            '2026-04-02T00:00:15.000Z'
+          ),
+          (
+            'thread-live',
+            'ready',
+            'codex',
+            'codex',
+            NULL,
+            NULL,
+            'full-access',
+            NULL,
+            NULL,
+            '2026-04-02T00:00:16.000Z'
+          ),
+          (
+            'thread-deleted',
+            'running',
+            'codex',
+            'codex',
+            NULL,
+            NULL,
+            'full-access',
+            'turn-deleted',
+            NULL,
+            '2026-04-02T00:00:17.000Z'
+          )
       `;
 
       // Both running turns on the live thread are returned even though only
@@ -1693,6 +1749,18 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
 
       const limited = yield* snapshotQuery.listRunningTurns(1);
       assert.equal(limited.length, 1);
+
+      // A session claiming liveness is dirty even with no running turn:
+      // thread-stale-active is stopped but still points at an already-settled
+      // turn, which is enough to make the strict lifecycle guard reject the
+      // next real turn. A ready session with no active turn is clean, and a
+      // deleted thread is never a candidate.
+      const liveClaimingThreadIds = yield* snapshotQuery.listThreadsWithLiveSessionClaims(200);
+      assert.deepStrictEqual(liveClaimingThreadIds, [
+        ThreadId.make("thread-archived"),
+        ThreadId.make("thread-stale-active"),
+      ]);
+      assert.equal((yield* snapshotQuery.listThreadsWithLiveSessionClaims(1)).length, 1);
 
       // Archiving does not stop a provider session, so the session read that
       // feeds reconciliation must not filter on archive state the way
@@ -1714,7 +1782,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         }),
       );
       assert.deepStrictEqual(
-        yield* snapshotQuery.getThreadSessionById(ThreadId.make("thread-live")),
+        yield* snapshotQuery.getThreadSessionById(ThreadId.make("thread-without-session")),
         Option.none(),
       );
     }),

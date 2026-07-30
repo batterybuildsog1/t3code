@@ -150,6 +150,21 @@ export interface ProjectionSnapshotQueryShape {
   ) => Effect.Effect<ReadonlyArray<ProjectionRunningTurn>, ProjectionRepositoryError>;
 
   /**
+   * Read every non-deleted thread whose session row still claims a live
+   * executor — a `running`/`starting` status, or an active turn it never
+   * released — capped at `limit`.
+   *
+   * This is broader than `listRunningTurns` on purpose. A turn can be settled
+   * while its session keeps claiming liveness (interrupting a turn settles the
+   * turn but leaves the session bound), and a stale non-null `activeTurnId` is
+   * not inert: it makes the strict provider lifecycle guard treat the next
+   * real turn as conflicting, so that turn never closes.
+   */
+  readonly listThreadsWithLiveSessionClaims: (
+    limit: number,
+  ) => Effect.Effect<ReadonlyArray<ThreadId>, ProjectionRepositoryError>;
+
+  /**
    * Read a thread's session row on its own.
    *
    * Unlike `getThreadShellById` this does not filter on archive state, so

@@ -1520,6 +1520,33 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
         },
       });
 
+      // A later boot reconciling the same thread again — the session can still
+      // claim liveness after the turn was settled — must not re-date a turn
+      // that is already terminal.
+      yield* eventStore.append({
+        type: "thread.session-set",
+        eventId: EventId.make("evt-br4"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-01-02T06:00:00.000Z",
+        commandId: CommandId.make("cmd-br4"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-br4"),
+        metadata: {},
+        payload: {
+          threadId,
+          session: {
+            threadId,
+            status: "interrupted",
+            providerName: "opencode",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: "2026-01-02T05:00:00.000Z",
+          },
+        },
+      });
+
       yield* projectionPipeline.bootstrap;
 
       const turnRows = yield* sql<{
@@ -1530,8 +1557,9 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
         FROM projection_turns
         WHERE thread_id = ${threadId} AND turn_id = ${turnId}
       `;
-      // completedAt comes from the session timestamp, not from the boot that
-      // noticed the death six hours later.
+      // completedAt comes from the session timestamp of the pass that actually
+      // settled it, not from the boot that noticed the death six hours later
+      // and not from the later session-only cleanup.
       assert.deepEqual(turnRows, [{ state: "interrupted", completedAt: executorLastSeenAt }]);
 
       // Clearing the active turn also clears the thread's latest turn, so the

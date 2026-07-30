@@ -138,6 +138,7 @@ it.effect("launchStartupHeartbeat does not block the caller while counts are loa
           getProjectShellById: () => Effect.succeed(Option.none()),
           getFirstActiveThreadIdByProjectId: () => Effect.succeed(Option.none()),
           listRunningTurns: () => Effect.die("unused"),
+          listThreadsWithLiveSessionClaims: () => Effect.die("unused"),
           getThreadSessionById: () => Effect.die("unused"),
           getThreadCheckpointContext: () => Effect.succeed(Option.none()),
           getFullThreadDiffContext: () => Effect.succeed(Option.none()),
@@ -203,6 +204,7 @@ it.effect("resolveAutoBootstrapWelcomeTargets returns existing project and threa
         getProjectShellById: () => Effect.die("unused"),
         getFirstActiveThreadIdByProjectId: () => Effect.succeed(Option.some(bootstrapThreadId)),
         listRunningTurns: () => Effect.die("unused"),
+        listThreadsWithLiveSessionClaims: () => Effect.die("unused"),
         getThreadSessionById: () => Effect.die("unused"),
         getThreadCheckpointContext: () => Effect.succeed(Option.none()),
         getFullThreadDiffContext: () => Effect.succeed(Option.none()),
@@ -249,6 +251,7 @@ it.effect("resolveAutoBootstrapWelcomeTargets creates a project and thread when 
         getProjectShellById: () => Effect.die("unused"),
         getFirstActiveThreadIdByProjectId: () => Effect.succeed(Option.none()),
         listRunningTurns: () => Effect.die("unused"),
+        listThreadsWithLiveSessionClaims: () => Effect.die("unused"),
         getThreadSessionById: () => Effect.die("unused"),
         getThreadCheckpointContext: () => Effect.succeed(Option.none()),
         getFullThreadDiffContext: () => Effect.succeed(Option.none()),
@@ -301,6 +304,7 @@ it.effect("resolveAutoBootstrapWelcomeTargets preserves typed UUID generation fa
         getProjectShellById: () => Effect.die("unused"),
         getFirstActiveThreadIdByProjectId: () => Effect.succeed(Option.none()),
         listRunningTurns: () => Effect.die("unused"),
+        listThreadsWithLiveSessionClaims: () => Effect.die("unused"),
         getThreadSessionById: () => Effect.die("unused"),
         getThreadCheckpointContext: () => Effect.succeed(Option.none()),
         getFullThreadDiffContext: () => Effect.succeed(Option.none()),
@@ -330,9 +334,10 @@ it.effect("resolveAutoBootstrapWelcomeTargets preserves typed UUID generation fa
 );
 
 // ---------------------------------------------------------------------------
-// reconcileOrphanedRunningTurns — boot-time dual of the live `session.exited`
-// settling path. The container can be destroyed mid-turn, which leaves
-// `projection_turns` on `state='running'` with no live executor to close it.
+// reconcileOrphanedSessions — boot-time dual of the live `session.exited`
+// settling path. The container can be destroyed mid-turn, which leaves a
+// running turn behind; it can equally be destroyed after the turn was already
+// settled, which leaves only a session still claiming a live executor.
 // ---------------------------------------------------------------------------
 
 const RECONCILE_BOOT_AT = "2026-01-01T06:00:00.000Z";
@@ -377,6 +382,7 @@ const reconcileProjectionSnapshotQuery = (
   getProjectShellById: () => Effect.die("unused"),
   getFirstActiveThreadIdByProjectId: () => Effect.die("unused"),
   listRunningTurns: () => Effect.succeed([]),
+  listThreadsWithLiveSessionClaims: () => Effect.succeed([]),
   getThreadSessionById: () => Effect.succeed(Option.some(reconcileSession)),
   getThreadCheckpointContext: () => Effect.die("unused"),
   getFullThreadDiffContext: () => Effect.die("unused"),
@@ -397,19 +403,22 @@ const reconcileProviderSessionDirectory = (
 });
 
 const runReconciliation = (input: {
-  readonly runningTurns: ReadonlyArray<ProjectionSnapshotQuery.ProjectionRunningTurn>;
+  readonly runningTurns?: ReadonlyArray<ProjectionSnapshotQuery.ProjectionRunningTurn>;
+  readonly liveClaimingThreadIds?: ReadonlyArray<ThreadId>;
   readonly bindings: ReadonlyArray<ProviderSessionDirectory.ProviderRuntimeBindingWithMetadata>;
   readonly session?: Option.Option<OrchestrationSession>;
+  readonly bootAt?: string;
 }) =>
   Effect.gen(function* () {
     const dispatched = yield* Ref.make<ReadonlyArray<OrchestrationCommand>>([]);
-    yield* ServerRuntimeStartup.reconcileOrphanedRunningTurns({
-      bootAt: RECONCILE_BOOT_AT,
+    yield* ServerRuntimeStartup.reconcileOrphanedSessions({
+      bootAt: input.bootAt ?? RECONCILE_BOOT_AT,
     }).pipe(
       Effect.provideService(
         ProjectionSnapshotQuery.ProjectionSnapshotQuery,
         reconcileProjectionSnapshotQuery({
-          listRunningTurns: () => Effect.succeed(input.runningTurns),
+          listRunningTurns: () => Effect.succeed(input.runningTurns ?? []),
+          listThreadsWithLiveSessionClaims: () => Effect.succeed(input.liveClaimingThreadIds ?? []),
           getThreadSessionById: () =>
             Effect.succeed(input.session ?? Option.some(reconcileSession)),
         }),
@@ -569,6 +578,108 @@ it.effect("falls back to boot time only when the runtime row has no usable last-
   }),
 );
 
+it.effect("settles a session-only orphan that has no running turn rows left", () =>
+  Effect.gen(function* () {
+    const commands = yield* runReconciliation({
+      liveClaimingThreadIds: [reconcileThreadId],
+      bindings: [reconcileBinding({ status: "running" })],
+    });
+
+    // No turn was cut short by this restart, so there is nothing to annotate.
+    assert.deepStrictEqual(
+      commands.map((command) => command.type),
+      ["thread.session.set"],
+    );
+
+    const [sessionCommand] = sessionSetCommands(commands);
+    // Keyed on the executor's death instant rather than a turn: stable within
+    // one death, distinct for the next one.
+    assert.strictEqual(
+      sessionCommand?.commandId,
+      `boot-reconcile:${reconcileThreadId}:session-${RECONCILE_LAST_SEEN_AT}:session-set`,
+    );
+    assert.strictEqual(sessionCommand?.session.activeTurnId, null);
+    assert.strictEqual(sessionCommand?.session.status, "interrupted");
+    assert.strictEqual(sessionCommand?.session.updatedAt, RECONCILE_LAST_SEEN_AT);
+  }),
+);
+
+it.effect("clears the stale active turn left behind by a stopped-then-rebooted session", () =>
+  // The live shape observed on the box: the user pressed Stop, which settled
+  // the turn but left a fresh session bound, and the box then rebooted. The
+  // runtime row still reads "running" and the session still points at the
+  // already-interrupted turn, which makes the strict lifecycle guard reject
+  // the next real turn's completion.
+  Effect.gen(function* () {
+    const staleTurnId = TurnId.make("opencode-turn-5616c4dc-862a-4c7c-8cdc-b69c51fda4b2");
+    const executorLastSeenAt = "2026-07-30T02:57:48.297Z";
+    const commands = yield* runReconciliation({
+      // The turn is already `interrupted`, so the running-turn scan is empty.
+      runningTurns: [],
+      liveClaimingThreadIds: [reconcileThreadId],
+      bindings: [reconcileBinding({ status: "running", lastSeenAt: executorLastSeenAt })],
+      session: Option.some({
+        threadId: reconcileThreadId,
+        status: "running",
+        providerName: "opencode",
+        providerInstanceId: ProviderInstanceId.make("opencode"),
+        runtimeMode: "full-access",
+        activeTurnId: staleTurnId,
+        lastError: null,
+        updatedAt: executorLastSeenAt,
+      }),
+      bootAt: "2026-07-30T14:05:00.000Z",
+    });
+
+    assert.deepStrictEqual(
+      commands.map((command) => command.type),
+      ["thread.session.set"],
+    );
+    const [sessionCommand] = sessionSetCommands(commands);
+    assert.deepStrictEqual(sessionCommand?.session, {
+      threadId: reconcileThreadId,
+      status: "interrupted",
+      providerName: "opencode",
+      providerInstanceId: ProviderInstanceId.make("opencode"),
+      runtimeMode: "full-access",
+      activeTurnId: null,
+      lastError: null,
+      updatedAt: "2026-07-30T02:57:48.297Z",
+    });
+    // The already-interrupted turn must not be annotated as cut short.
+    assert.deepStrictEqual(activityAppendCommands(commands), []);
+  }),
+);
+
+it.effect("dispatches once for a thread caught by both detections", () =>
+  Effect.gen(function* () {
+    const commands = yield* runReconciliation({
+      runningTurns: [{ threadId: reconcileThreadId, turnId: reconcileTurnId }],
+      liveClaimingThreadIds: [reconcileThreadId],
+      bindings: [reconcileBinding({})],
+    });
+
+    assert.strictEqual(sessionSetCommands(commands).length, 1);
+    // The turn-keyed id wins, so the running turn still gets its note.
+    assert.strictEqual(
+      sessionSetCommands(commands)[0]?.commandId,
+      `boot-reconcile:${reconcileThreadId}:${reconcileTurnId}:session-set`,
+    );
+    assert.strictEqual(activityAppendCommands(commands).length, 1);
+  }),
+);
+
+it.effect("leaves a live-claiming session alone when its executor outlives this boot", () =>
+  Effect.gen(function* () {
+    const commands = yield* runReconciliation({
+      liveClaimingThreadIds: [reconcileThreadId],
+      bindings: [reconcileBinding({ status: "running", lastSeenAt: "2026-01-01T06:00:01.000Z" })],
+    });
+
+    assert.deepStrictEqual(commands, []);
+  }),
+);
+
 /**
  * `startup` runs under `Effect.exit`; a failure there fails command readiness
  * for the rest of the process while HTTP keeps answering. Reconciliation is
@@ -577,7 +688,7 @@ it.effect("falls back to boot time only when the runtime row has no usable last-
 const runContainedReconciliation = (
   listRunningTurns: ProjectionSnapshotQuery.ProjectionSnapshotQueryShape["listRunningTurns"],
 ) =>
-  ServerRuntimeStartup.runStartupTurnReconciliation({ bootAt: RECONCILE_BOOT_AT }).pipe(
+  ServerRuntimeStartup.runStartupSessionReconciliation({ bootAt: RECONCILE_BOOT_AT }).pipe(
     Effect.provideService(
       ProjectionSnapshotQuery.ProjectionSnapshotQuery,
       reconcileProjectionSnapshotQuery({ listRunningTurns }),

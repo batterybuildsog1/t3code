@@ -171,10 +171,11 @@ export const launchStartupHeartbeat = recordStartupHeartbeat.pipe(
 );
 
 /**
- * Bound on one boot's reconciliation scan. Truncation is logged rather than
- * silent, and the remainder settles on the next boot.
+ * Bound on one boot's reconciliation scan, applied to each detection query.
+ * Truncation is logged rather than silent, and the remainder settles on the
+ * next boot.
  */
-export const ORPHANED_RUNNING_TURN_SCAN_LIMIT = 200;
+export const ORPHANED_SESSION_SCAN_LIMIT = 200;
 
 /**
  * Timeline copy for a turn cut short by a server restart. Settling clears the
@@ -184,8 +185,17 @@ export const ORPHANED_RUNNING_TURN_SCAN_LIMIT = 200;
 export const RESTART_INTERRUPTED_TURN_NOTE =
   "Watchman restarted while working on this, so this reply was cut short. Send your request again if you still need it.";
 
-const bootReconcileCommandId = (threadId: ThreadId, turnId: TurnId, tag: string) =>
-  CommandId.make(`boot-reconcile:${threadId}:${turnId}:${tag}`);
+/**
+ * Command ids are derived rather than random so a boot that repeats work
+ * already committed short-circuits on the stored receipt.
+ *
+ * The discriminator is the settled turn where there is one. A session-only
+ * orphan has no turn, so it uses the executor's last-seen instant instead:
+ * stable for one death (a retried boot dedupes) and distinct for the next one
+ * (a thread that goes dirty again is not silently skipped).
+ */
+const bootReconcileCommandId = (threadId: ThreadId, discriminator: string, tag: string) =>
+  CommandId.make(`boot-reconcile:${threadId}:${discriminator}:${tag}`);
 
 /**
  * Boot-time dual of the live executor-death path.
@@ -194,32 +204,50 @@ const bootReconcileCommandId = (threadId: ThreadId, turnId: TurnId, tag: string)
  * `session.exited`, runtime ingestion writes a "stopped" session, and the
  * `thread.session-set` projector settles the thread's running turns. The one
  * death the server cannot observe live is its own: a killed or destroyed
- * process leaves `projection_turns` on `state='running'` with a null
- * `completed_at` while its provider is gone, and every client renders that
- * turn as still working forever.
+ * process leaves rows claiming a live executor that no longer exists.
  *
- * This replays the same settling path from persisted state rather than from a
- * runtime event, so turn settling keeps exactly one implementation.
+ * The invariant enforced here is that no session may claim to be live when its
+ * executor predates this process. Two shapes violate it:
+ *
+ *  - A turn still recorded as `running`, which every client renders as working
+ *    forever.
+ *  - A session still `running`/`starting`, or still holding an `activeTurnId`,
+ *    after its turn was already settled. Pressing Stop settles the turn but
+ *    leaves the session bound, so this outlives the first shape. It is not
+ *    cosmetic: a stale `activeTurnId` makes the strict lifecycle guard in
+ *    `ProviderRuntimeIngestion` treat the next real turn as conflicting and
+ *    refuse its `turn.completed`, which produces a fresh immortal spinner on a
+ *    thread that looked clean.
+ *
+ * Both are remedied by replaying the same settling path from persisted state
+ * rather than from a runtime event, so settling keeps one implementation.
  */
-export const reconcileOrphanedRunningTurns = (input: { readonly bootAt: string }) =>
+export const reconcileOrphanedSessions = (input: { readonly bootAt: string }) =>
   Effect.gen(function* () {
     const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
     const providerSessionDirectory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
     const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
 
-    const runningTurns = yield* projectionSnapshotQuery.listRunningTurns(
-      ORPHANED_RUNNING_TURN_SCAN_LIMIT,
-    );
-    if (runningTurns.length === 0) {
-      return;
-    }
-    if (runningTurns.length >= ORPHANED_RUNNING_TURN_SCAN_LIMIT) {
-      yield* Effect.logWarning("startup turn reconciliation truncated its scan", {
+    const [runningTurns, liveClaimingThreadIds] = yield* Effect.all([
+      projectionSnapshotQuery.listRunningTurns(ORPHANED_SESSION_SCAN_LIMIT),
+      projectionSnapshotQuery.listThreadsWithLiveSessionClaims(ORPHANED_SESSION_SCAN_LIMIT),
+    ]);
+    if (runningTurns.length >= ORPHANED_SESSION_SCAN_LIMIT) {
+      yield* Effect.logWarning("startup session reconciliation truncated its running-turn scan", {
         scanned: runningTurns.length,
-        limit: ORPHANED_RUNNING_TURN_SCAN_LIMIT,
+        limit: ORPHANED_SESSION_SCAN_LIMIT,
+      });
+    }
+    if (liveClaimingThreadIds.length >= ORPHANED_SESSION_SCAN_LIMIT) {
+      yield* Effect.logWarning("startup session reconciliation truncated its session scan", {
+        scanned: liveClaimingThreadIds.length,
+        limit: ORPHANED_SESSION_SCAN_LIMIT,
       });
     }
 
+    // Keyed by thread so a thread caught by both detections is settled once.
+    // An empty turn list means a session-only orphan: there is no truncated
+    // reply to annotate, so it gets no restart note.
     const turnIdsByThreadId = new Map<ThreadId, Array<TurnId>>();
     for (const runningTurn of runningTurns) {
       const existing = turnIdsByThreadId.get(runningTurn.threadId);
@@ -228,6 +256,14 @@ export const reconcileOrphanedRunningTurns = (input: { readonly bootAt: string }
         continue;
       }
       turnIdsByThreadId.set(runningTurn.threadId, [runningTurn.turnId]);
+    }
+    for (const threadId of liveClaimingThreadIds) {
+      if (!turnIdsByThreadId.has(threadId)) {
+        turnIdsByThreadId.set(threadId, []);
+      }
+    }
+    if (turnIdsByThreadId.size === 0) {
+      return;
     }
 
     const bindings = yield* providerSessionDirectory.listBindings();
@@ -252,7 +288,7 @@ export const reconcileOrphanedRunningTurns = (input: { readonly bootAt: string }
           // death — settling on it would race any process that has bound a
           // session without writing its row yet.
           yield* Effect.logWarning(
-            "startup turn reconciliation skipped a running turn with no provider runtime row",
+            "startup session reconciliation skipped a thread with no provider runtime row",
             { threadId, runningTurnCount: turnIds.length },
           );
           return false;
@@ -263,21 +299,18 @@ export const reconcileOrphanedRunningTurns = (input: { readonly bootAt: string }
           Number.isFinite(lastSeenAtMs) && Number.isFinite(bootAtMs) && lastSeenAtMs < bootAtMs;
         if (binding.status !== "stopped" && !lastSeenBeforeBoot) {
           yield* Effect.logDebug(
-            "startup turn reconciliation skipped a running turn whose executor still looks alive",
+            "startup session reconciliation skipped a thread whose executor still looks alive",
             { threadId, status: binding.status ?? null, lastSeenAt: binding.lastSeenAt },
           );
           return false;
         }
 
-        // The settled turn's `completedAt` is taken from this timestamp, so it
+        // A settled turn's `completedAt` is taken from this timestamp, so it
         // has to be the instant the executor was last alive. Boot time would
         // report a turn killed at 19:23 and reconciled six hours later as a
         // six-hour turn.
         const settledAt = Number.isFinite(lastSeenAtMs) ? binding.lastSeenAt : input.bootAt;
         const settleTurnId = turnIds[0];
-        if (settleTurnId === undefined) {
-          return false;
-        }
         // `thread.session-set` replaces the whole session row, so every field
         // has to be carried forward — a null `providerName` would wipe it.
         const session = Option.getOrUndefined(
@@ -286,7 +319,11 @@ export const reconcileOrphanedRunningTurns = (input: { readonly bootAt: string }
 
         yield* orchestrationEngine.dispatch({
           type: "thread.session.set",
-          commandId: bootReconcileCommandId(threadId, settleTurnId, "session-set"),
+          commandId: bootReconcileCommandId(
+            threadId,
+            settleTurnId ?? `session-${settledAt}`,
+            "session-set",
+          ),
           threadId,
           session: {
             threadId,
@@ -303,8 +340,10 @@ export const reconcileOrphanedRunningTurns = (input: { readonly bootAt: string }
           createdAt: input.bootAt,
         });
 
-        // Settled after the session write: a note on a turn that is still
-        // spinning would be worse than no note at all.
+        // Annotated after the session write, and only for turns this pass
+        // actually settled: a note on a turn that is still spinning would be
+        // worse than no note at all, and a turn that was already terminal was
+        // not cut short by this restart.
         yield* Effect.forEach(
           turnIds,
           (turnId) =>
@@ -326,7 +365,7 @@ export const reconcileOrphanedRunningTurns = (input: { readonly bootAt: string }
           { concurrency: 1, discard: true },
         );
 
-        yield* Effect.logInfo("startup turn reconciliation settled an orphaned turn", {
+        yield* Effect.logInfo("startup session reconciliation settled an orphaned session", {
           threadId,
           turnIds,
           settledAt,
@@ -335,7 +374,7 @@ export const reconcileOrphanedRunningTurns = (input: { readonly bootAt: string }
       }).pipe(
         // One unsettleable thread must not strand the rest of the scan.
         Effect.catchCause((cause) =>
-          Effect.logWarning("startup turn reconciliation failed for a thread", {
+          Effect.logWarning("startup session reconciliation failed for a thread", {
             threadId,
             cause,
           }).pipe(Effect.as(false)),
@@ -350,8 +389,9 @@ export const reconcileOrphanedRunningTurns = (input: { readonly bootAt: string }
 
     const settledThreadCount = settled.filter((wasSettled) => wasSettled).length;
     if (settledThreadCount > 0) {
-      yield* Effect.logInfo("startup turn reconciliation complete", {
+      yield* Effect.logInfo("startup session reconciliation complete", {
         settledThreadCount,
+        scannedThreadCount: turnIdsByThreadId.size,
         scannedTurnCount: runningTurns.length,
       });
     }
@@ -365,14 +405,14 @@ export const reconcileOrphanedRunningTurns = (input: { readonly bootAt: string }
  * escape: a slow database, a typed failure, and a defect all resolve to a log
  * line and a successful phase.
  */
-export const runStartupTurnReconciliation = (input: { readonly bootAt: string }) =>
-  reconcileOrphanedRunningTurns(input).pipe(
+export const runStartupSessionReconciliation = (input: { readonly bootAt: string }) =>
+  reconcileOrphanedSessions(input).pipe(
     Effect.timeout("10 seconds"),
     Effect.catchCause((cause) =>
-      Effect.logWarning("startup turn reconciliation did not complete", { cause }),
+      Effect.logWarning("startup session reconciliation did not complete", { cause }),
     ),
     Effect.catchDefect((defect) =>
-      Effect.logWarning("startup turn reconciliation defect", { defect }),
+      Effect.logWarning("startup session reconciliation defect", { defect }),
     ),
   );
 
@@ -646,11 +686,12 @@ export const make = Effect.gen(function* () {
     );
 
     // Runs after the reactors subscribe and before `signalCommandReady` opens
-    // the command gate, so clients never read a still-running orphaned turn.
-    yield* Effect.logDebug("startup phase: reconciling orphaned running turns");
+    // the command gate, so clients never read a session left claiming a dead
+    // executor.
+    yield* Effect.logDebug("startup phase: reconciling orphaned sessions");
     yield* runStartupPhase(
       "turns.reconcile",
-      runStartupTurnReconciliation({ bootAt: runtimeStartedAt }),
+      runStartupSessionReconciliation({ bootAt: runtimeStartedAt }),
     );
 
     const welcomeBase = yield* resolveWelcomeBase;

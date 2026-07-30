@@ -948,6 +948,26 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       `,
   });
 
+  const listLiveClaimingSessionRows = SqlSchema.findAll({
+    Request: RunningTurnLookupInput,
+    Result: ProjectionThreadIdLookupRowSchema,
+    execute: ({ limit }) =>
+      sql`
+        SELECT
+          sessions.thread_id AS "threadId"
+        FROM projection_thread_sessions AS sessions
+        INNER JOIN projection_threads AS threads
+          ON threads.thread_id = sessions.thread_id
+        WHERE threads.deleted_at IS NULL
+          AND (
+            sessions.status IN ('running', 'starting')
+            OR sessions.active_turn_id IS NOT NULL
+          )
+        ORDER BY sessions.thread_id ASC
+        LIMIT ${limit}
+      `,
+  });
+
   const getFullThreadDiffContextRow = SqlSchema.findOneOption({
     Request: FullThreadDiffContextLookupInput,
     Result: ProjectionFullThreadDiffContextRowSchema,
@@ -1846,6 +1866,18 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       ),
     );
 
+  const listThreadsWithLiveSessionClaims: ProjectionSnapshotQueryShape["listThreadsWithLiveSessionClaims"] =
+    (limit) =>
+      listLiveClaimingSessionRows({ limit }).pipe(
+        Effect.mapError(
+          toPersistenceSqlOrDecodeError(
+            "ProjectionSnapshotQuery.listThreadsWithLiveSessionClaims:query",
+            "ProjectionSnapshotQuery.listThreadsWithLiveSessionClaims:decodeRows",
+          ),
+        ),
+        Effect.map((rows) => rows.map((row) => row.threadId)),
+      );
+
   const getThreadSessionById: ProjectionSnapshotQueryShape["getThreadSessionById"] = (threadId) =>
     getThreadSessionRowByThread({ threadId }).pipe(
       Effect.mapError(
@@ -2171,6 +2203,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     getProjectShellById,
     getFirstActiveThreadIdByProjectId,
     listRunningTurns,
+    listThreadsWithLiveSessionClaims,
     getThreadSessionById,
     getThreadCheckpointContext,
     getFullThreadDiffContext,
