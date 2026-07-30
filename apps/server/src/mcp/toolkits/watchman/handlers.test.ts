@@ -1410,6 +1410,79 @@ it.effect("fails closed before filing and surfaces exclusive-create collisions",
     expect(allTransport.isError).toBe(true);
     expect(filed).toHaveLength(0);
 
+    const tvAScene = yield* call({
+      operation: "scene",
+      screen: "a",
+      scene_name: "party",
+    });
+    expect(tvAScene.isError).toBe(true);
+    expect(filed).toHaveLength(0);
+
+    yield* TestClock.setTime(1_000_000_000);
+    for (const arguments_ of [
+      {
+        operation: "play",
+        screen: "a",
+        app: "youtube",
+        content_id: "video:watchman-proof",
+      },
+      {
+        operation: "show",
+        screen: "a",
+        view: "solar.primary",
+      },
+      {
+        operation: "transport",
+        screen: "a",
+        action: "pause",
+      },
+      {
+        operation: "hold",
+        screen: "a",
+        expires_at: 1_003_600,
+      },
+      {
+        operation: "release",
+        screen: "a",
+      },
+    ]) {
+      expect((yield* call(arguments_)).isError).toBe(false);
+    }
+    expect(
+      filed.map(({ screen, intent, payload }) => ({
+        screen,
+        intent,
+        payload,
+      })),
+    ).toEqual([
+      {
+        screen: "a",
+        intent: "play",
+        payload: { app: "youtube", content_id: "video:watchman-proof" },
+      },
+      {
+        screen: "a",
+        intent: "show",
+        payload: { view: "solar.primary" },
+      },
+      {
+        screen: "a",
+        intent: "transport",
+        payload: { action: "pause" },
+      },
+      {
+        screen: "a",
+        intent: "hold",
+        payload: { expires_at: 1_003_600 },
+      },
+      {
+        screen: "a",
+        intent: "release",
+        payload: {},
+      },
+    ]);
+    const filedBeforeUnavailable = filed.length;
+
     mode = "stale";
     const stale = yield* call({
       operation: "power",
@@ -1422,7 +1495,7 @@ it.effect("fails closed before filing and surfaces exclusive-create collisions",
       applied: "unavailable",
       observed: { health: { age_s: 181 } },
     });
-    expect(filed).toHaveLength(0);
+    expect(filed).toHaveLength(filedBeforeUnavailable);
 
     mode = "collision";
     const collision = yield* call({
@@ -1432,7 +1505,7 @@ it.effect("fails closed before filing and surfaces exclusive-create collisions",
     });
     expect(collision.isError).toBe(true);
     expect(collision.structuredContent).toBeUndefined();
-    expect(filed).toHaveLength(0);
+    expect(filed).toHaveLength(filedBeforeUnavailable);
   }).pipe(Effect.provide(TestLayer));
 });
 

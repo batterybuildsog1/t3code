@@ -3,9 +3,11 @@ import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Result from "effect/Result";
+import * as Schema from "effect/Schema";
 
 import * as TvdSpool from "./TvdSpool.ts";
 
+const decodeTvdRequest = Schema.decodeUnknownEffect(TvdSpool.TvdRequest);
 const request: TvdSpool.TvdRequest = {
   schema: 1,
   request_id: "00000000-0000-4000-8000-000000000001",
@@ -16,6 +18,20 @@ const request: TvdSpool.TvdRequest = {
   issued_at: 1_000_000,
   ttl_s: 120,
 };
+
+it.effect("rejects removed generic and unwitnessed intents at the spool boundary", () =>
+  Effect.gen(function* () {
+    for (const intent of ["volume", "navigate", "input_text"]) {
+      const result = yield* Effect.result(
+        decodeTvdRequest({
+          ...request,
+          intent,
+        }),
+      );
+      expect(Result.isFailure(result)).toBe(true);
+    }
+  }),
+);
 
 it.effect("creates mode-0600 requests exclusively and decodes tvd files", () =>
   Effect.scoped(

@@ -13,18 +13,7 @@ export const TvdRequest = Schema.Struct({
   request_id: Schema.String,
   source: Schema.Literal("t3"),
   screen: Schema.Literals(["a", "b", "c", "d", "all"]),
-  intent: Schema.Literals([
-    "play",
-    "show",
-    "scene",
-    "transport",
-    "volume",
-    "power",
-    "hold",
-    "release",
-    "navigate",
-    "input_text",
-  ]),
+  intent: Schema.Literals(["play", "show", "scene", "transport", "power", "hold", "release"]),
   payload: Schema.Record(Schema.String, Schema.Unknown),
   lease: Schema.optional(
     Schema.Struct({

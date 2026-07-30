@@ -816,11 +816,19 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
   if (
     input.screen === "a" &&
     !(
+      input.operation === "play" ||
+      input.operation === "transport" ||
+      input.operation === "hold" ||
+      input.operation === "release" ||
       (input.operation === "power" && input.power === "on") ||
       (input.operation === "show" && input.view === "solar.primary")
     )
   ) {
-    return yield* fail(tool, "controller", "TV A allows solar.primary restore and power-on only.");
+    return yield* fail(
+      tool,
+      "controller",
+      "TV A allows play, transport, hold, release, solar.primary restore, and power-on; requested power-off and scene membership are unavailable.",
+    );
   }
 
   const spool = yield* TvdSpool.TvdSpool;
