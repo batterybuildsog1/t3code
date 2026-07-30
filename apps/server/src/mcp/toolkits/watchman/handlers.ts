@@ -750,16 +750,6 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
     if (input.view === undefined) {
       return yield* fail(tool, "controller", "show requires a canonical view.");
     }
-    if (
-      (input.screen === "a" && input.view !== "solar.primary") ||
-      (input.screen !== "a" && input.view !== "wall.dashboard")
-    ) {
-      return yield* fail(
-        tool,
-        "controller",
-        "show requires solar.primary on TV A or wall.dashboard on TVs B-D.",
-      );
-    }
     payload = { view: input.view };
   } else if (input.operation === "scene") {
     if (input.scene_name === undefined) {
@@ -767,17 +757,6 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
     }
     if (input.members !== undefined && new Set(input.members).size !== input.members.length) {
       return yield* fail(tool, "controller", "scene members must be unique.");
-    }
-    if (
-      input.screen !== "all" &&
-      input.members !== undefined &&
-      (input.members.length !== 1 || input.members[0] !== input.screen)
-    ) {
-      return yield* fail(
-        tool,
-        "controller",
-        "Scene members must exactly match a single-screen target.",
-      );
     }
     payload = {
       name: input.scene_name,
@@ -808,27 +787,6 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
     payload = { expires_at: input.expires_at };
   } else {
     payload = {};
-  }
-
-  if (input.screen === "all" && ["transport", "hold"].includes(input.operation)) {
-    return yield* fail(tool, "controller", `${input.operation} targets exactly one screen.`);
-  }
-  if (
-    input.screen === "a" &&
-    !(
-      input.operation === "play" ||
-      input.operation === "transport" ||
-      input.operation === "hold" ||
-      input.operation === "release" ||
-      (input.operation === "power" && input.power === "on") ||
-      (input.operation === "show" && input.view === "solar.primary")
-    )
-  ) {
-    return yield* fail(
-      tool,
-      "controller",
-      "TV A allows play, transport, hold, release, solar.primary restore, and power-on; requested power-off and scene membership are unavailable.",
-    );
   }
 
   const spool = yield* TvdSpool.TvdSpool;

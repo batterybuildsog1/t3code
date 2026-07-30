@@ -607,15 +607,6 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
       applied: "verified",
     });
 
-    const postsBeforeTvA = calls.filter(({ method }) => method === "POST").length;
-    const tvA = yield* call("watchman_tv_control", {
-      operation: "show",
-      screen: "a",
-      view: "wall.dashboard",
-    });
-    expect(tvA.isError).toBe(true);
-    expect(calls.filter(({ method }) => method === "POST")).toHaveLength(postsBeforeTvA);
-
     const tvDashboard = yield* call("watchman_tv_control", {
       operation: "show",
       screen: "d",
@@ -1343,7 +1334,7 @@ it.effect("returns pending after the receipt budget and names the durable receip
   }).pipe(Effect.provide(TestLayer));
 });
 
-it.effect("fails closed before filing and surfaces exclusive-create collisions", () => {
+it.effect("lets tvd own policy and blocks stale health or file collisions", () => {
   let mode: "normal" | "stale" | "collision" = "normal";
   const filed: Array<TvdSpool.TvdRequest> = [];
   const CliLayer = Layer.succeed(
@@ -1375,6 +1366,23 @@ it.effect("fails closed before filing and surfaces exclusive-create collisions",
         filed.push(request);
       });
     },
+    readReceipt: (id) => {
+      const request = filed.at(-1)!;
+      const controllerRejects =
+        (request.screen === "a" &&
+          ((request.intent === "power" && request.payload.state === "off") ||
+            request.intent === "scene")) ||
+        (request.screen === "all" && ["transport", "hold"].includes(request.intent));
+      return Effect.succeed({
+        requested: { request_id: id, intent: request.intent, screen: request.screen },
+        accepted: controllerRejects ? "rejected(controller_policy)" : "accepted",
+        applied: controllerRejects ? "failed" : "verified",
+        observed: {},
+        evidence: controllerRejects
+          ? "tvd rejected the screen/intent combination"
+          : "tvd verified the request",
+      });
+    },
   });
   const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
     Layer.provide(WatchmanToolkitHandlersLive),
@@ -1394,29 +1402,18 @@ it.effect("fails closed before filing and surfaces exclusive-create collisions",
           Effect.provideService(McpSchema.McpServerClient, client),
         );
 
-    const tvAPowerOff = yield* call({
-      operation: "power",
-      screen: "a",
-      power: "off",
-    });
-    expect(tvAPowerOff.isError).toBe(true);
-    expect(filed).toHaveLength(0);
-
-    const allTransport = yield* call({
-      operation: "transport",
-      screen: "all",
-      action: "pause",
-    });
-    expect(allTransport.isError).toBe(true);
-    expect(filed).toHaveLength(0);
-
-    const tvAScene = yield* call({
-      operation: "scene",
-      screen: "a",
-      scene_name: "party",
-    });
-    expect(tvAScene.isError).toBe(true);
-    expect(filed).toHaveLength(0);
+    for (const controllerPolicy of [
+      { operation: "power", screen: "a", power: "off" },
+      { operation: "scene", screen: "a", scene_name: "party" },
+      { operation: "transport", screen: "all", action: "pause" },
+    ]) {
+      const rejected = yield* call(controllerPolicy);
+      expect(rejected.isError).toBe(false);
+      expect(rejected.structuredContent).toMatchObject({
+        accepted: "rejected(controller_policy)",
+        applied: "failed",
+      });
+    }
 
     yield* TestClock.setTime(1_000_000_000);
     for (const arguments_ of [
@@ -1449,7 +1446,7 @@ it.effect("fails closed before filing and surfaces exclusive-create collisions",
       expect((yield* call(arguments_)).isError).toBe(false);
     }
     expect(
-      filed.map(({ screen, intent, payload }) => ({
+      filed.slice(-5).map(({ screen, intent, payload }) => ({
         screen,
         intent,
         payload,
