@@ -423,7 +423,9 @@ export function getAutoBootstrapDefaultModelSelection(
   return isWatchmanWorkspaceRoot(workspaceRoot, watchmanProjectRoot)
     ? {
         instanceId: ProviderInstanceId.make("opencode"),
-        model: "cerebras/zai-glm-4.7",
+        // Grok 4.5, not GLM: Cerebras hard-fails the turn once messages +
+        // completion pass its 8,192-token ceiling (bit twice, 7/29 and 7/30).
+        model: "xai/grok-4.5",
         options: [{ id: "agent", value: "watchman-control" }],
       }
     : {

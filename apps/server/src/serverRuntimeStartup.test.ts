@@ -40,7 +40,7 @@ it("uses Watchman Control as the Watchman project default", () => {
     ServerRuntimeStartup.getAutoBootstrapDefaultModelSelection("/srv/watchman", "/srv/watchman"),
     {
       instanceId: ProviderInstanceId.make("opencode"),
-      model: "cerebras/zai-glm-4.7",
+      model: "xai/grok-4.5",
       options: [{ id: "agent", value: "watchman-control" }],
     },
   );
