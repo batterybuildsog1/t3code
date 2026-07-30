@@ -11,6 +11,7 @@ import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
@@ -1421,6 +1422,301 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
       const fullSnapshot = yield* snapshotQuery.getSnapshot();
       assert.equal(fullSnapshot.threads[0]?.latestTurn?.turnId, asTurnId("turn-running"));
       assert.equal(fullSnapshot.threads[0]?.latestTurn?.state, "running");
+    }),
+  );
+
+  it.effect("lists every running turn on live threads for boot-time reconciliation", () =>
+    Effect.gen(function* () {
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+
+      yield* sql`DELETE FROM projection_projects`;
+      yield* sql`DELETE FROM projection_threads`;
+      yield* sql`DELETE FROM projection_turns`;
+
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id,
+          title,
+          workspace_root,
+          default_model_selection_json,
+          scripts_json,
+          created_at,
+          updated_at,
+          deleted_at
+        )
+        VALUES (
+          'project-1',
+          'Project 1',
+          '/tmp/project-1',
+          '{"provider":"codex","model":"gpt-5-codex"}',
+          '[]',
+          '2026-04-02T00:00:00.000Z',
+          '2026-04-02T00:00:01.000Z',
+          NULL
+        )
+      `;
+
+      yield* sql`
+        INSERT INTO projection_threads (
+          thread_id,
+          project_id,
+          title,
+          model_selection_json,
+          runtime_mode,
+          interaction_mode,
+          branch,
+          worktree_path,
+          latest_turn_id,
+          latest_user_message_at,
+          pending_approval_count,
+          pending_user_input_count,
+          has_actionable_proposed_plan,
+          created_at,
+          updated_at,
+          archived_at,
+          deleted_at
+        )
+        VALUES
+          (
+            'thread-live',
+            'project-1',
+            'Live thread',
+            '{"provider":"codex","model":"gpt-5-codex"}',
+            'full-access',
+            'default',
+            NULL,
+            NULL,
+            'turn-live-b',
+            NULL,
+            0,
+            0,
+            0,
+            '2026-04-02T00:00:02.000Z',
+            '2026-04-02T00:00:03.000Z',
+            NULL,
+            NULL
+          ),
+          (
+            'thread-archived',
+            'project-1',
+            'Archived thread',
+            '{"provider":"codex","model":"gpt-5-codex"}',
+            'full-access',
+            'default',
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            0,
+            0,
+            0,
+            '2026-04-02T00:00:02.000Z',
+            '2026-04-02T00:00:03.000Z',
+            '2026-04-02T00:00:04.000Z',
+            NULL
+          ),
+          (
+            'thread-deleted',
+            'project-1',
+            'Deleted thread',
+            '{"provider":"codex","model":"gpt-5-codex"}',
+            'full-access',
+            'default',
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            0,
+            0,
+            0,
+            '2026-04-02T00:00:02.000Z',
+            '2026-04-02T00:00:03.000Z',
+            NULL,
+            '2026-04-02T00:00:05.000Z'
+          )
+      `;
+
+      yield* sql`
+        INSERT INTO projection_turns (
+          thread_id,
+          turn_id,
+          pending_message_id,
+          source_proposed_plan_thread_id,
+          source_proposed_plan_id,
+          assistant_message_id,
+          state,
+          requested_at,
+          started_at,
+          completed_at,
+          checkpoint_turn_count,
+          checkpoint_ref,
+          checkpoint_status,
+          checkpoint_files_json
+        )
+        VALUES
+          (
+            'thread-live',
+            'turn-live-b',
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            'running',
+            '2026-04-02T00:00:30.000Z',
+            '2026-04-02T00:00:30.000Z',
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            '[]'
+          ),
+          (
+            'thread-live',
+            'turn-live-a',
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            'running',
+            '2026-04-02T00:00:10.000Z',
+            '2026-04-02T00:00:10.000Z',
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            '[]'
+          ),
+          (
+            'thread-live',
+            'turn-live-done',
+            NULL,
+            NULL,
+            NULL,
+            'message-assistant-1',
+            'completed',
+            '2026-04-02T00:00:05.000Z',
+            '2026-04-02T00:00:06.000Z',
+            '2026-04-02T00:00:08.000Z',
+            NULL,
+            NULL,
+            NULL,
+            '[]'
+          ),
+          (
+            'thread-live',
+            NULL,
+            'message-user-pending',
+            NULL,
+            NULL,
+            NULL,
+            'pending',
+            '2026-04-02T00:00:40.000Z',
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            '[]'
+          ),
+          (
+            'thread-archived',
+            'turn-archived',
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            'running',
+            '2026-04-02T00:00:12.000Z',
+            '2026-04-02T00:00:12.000Z',
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            '[]'
+          ),
+          (
+            'thread-deleted',
+            'turn-deleted',
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            'running',
+            '2026-04-02T00:00:14.000Z',
+            '2026-04-02T00:00:14.000Z',
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            '[]'
+          )
+      `;
+
+      yield* sql`DELETE FROM projection_thread_sessions`;
+      yield* sql`
+        INSERT INTO projection_thread_sessions (
+          thread_id,
+          status,
+          provider_name,
+          provider_instance_id,
+          provider_session_id,
+          provider_thread_id,
+          runtime_mode,
+          active_turn_id,
+          last_error,
+          updated_at
+        )
+        VALUES (
+          'thread-archived',
+          'running',
+          'opencode',
+          'opencode',
+          'provider-session-archived',
+          'provider-thread-archived',
+          'auto-accept-edits',
+          'turn-archived',
+          'earlier failure',
+          '2026-04-02T00:00:13.000Z'
+        )
+      `;
+
+      // Both running turns on the live thread are returned even though only
+      // one is `latest_turn_id`, archived threads still hold settleable turns,
+      // deleted threads do not, and pending placeholders carry no turn.
+      const runningTurns = yield* snapshotQuery.listRunningTurns(200);
+      assert.deepStrictEqual(runningTurns, [
+        { threadId: ThreadId.make("thread-archived"), turnId: asTurnId("turn-archived") },
+        { threadId: ThreadId.make("thread-live"), turnId: asTurnId("turn-live-a") },
+        { threadId: ThreadId.make("thread-live"), turnId: asTurnId("turn-live-b") },
+      ]);
+
+      const limited = yield* snapshotQuery.listRunningTurns(1);
+      assert.equal(limited.length, 1);
+
+      // Archiving does not stop a provider session, so the session read that
+      // feeds reconciliation must not filter on archive state the way
+      // getThreadShellById does.
+      const archivedSession = yield* snapshotQuery.getThreadSessionById(
+        ThreadId.make("thread-archived"),
+      );
+      assert.deepStrictEqual(
+        archivedSession,
+        Option.some({
+          threadId: ThreadId.make("thread-archived"),
+          status: "running",
+          providerName: "opencode",
+          providerInstanceId: ProviderInstanceId.make("opencode"),
+          runtimeMode: "auto-accept-edits",
+          activeTurnId: asTurnId("turn-archived"),
+          lastError: "earlier failure",
+          updatedAt: "2026-04-02T00:00:13.000Z",
+        }),
+      );
+      assert.deepStrictEqual(
+        yield* snapshotQuery.getThreadSessionById(ThreadId.make("thread-live")),
+        Option.none(),
+      );
     }),
   );
 

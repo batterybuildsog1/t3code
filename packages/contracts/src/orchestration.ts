@@ -323,6 +323,15 @@ export const OrchestrationThreadActivity = Schema.Struct({
 });
 export type OrchestrationThreadActivity = typeof OrchestrationThreadActivity.Type;
 
+/**
+ * Activity kind written when boot-time reconciliation settles a turn whose
+ * executor died with the server process. Settling clears the thread's active
+ * turn, so the turn leaves the thread shell entirely and nothing else survives
+ * to tell the user their reply was cut short — clients render this activity as
+ * a timeline notice instead of a work-log line.
+ */
+export const TURN_RESTART_INTERRUPTED_ACTIVITY_KIND = "turn.restart-interrupted";
+
 const OrchestrationLatestTurnState = Schema.Literals([
   "running",
   "interrupted",

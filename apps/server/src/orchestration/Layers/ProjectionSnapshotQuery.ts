@@ -55,6 +55,7 @@ import {
   ProjectionSnapshotQuery,
   type ProjectionFullThreadDiffContext,
   type ProjectionSnapshotCounts,
+  type ProjectionRunningTurn,
   type ProjectionThreadCheckpointContext,
   type ProjectionSnapshotQueryShape,
 } from "../Services/ProjectionSnapshotQuery.ts";
@@ -127,6 +128,13 @@ const ProjectionThreadCheckpointContextThreadRowSchema = Schema.Struct({
   projectId: ProjectId,
   workspaceRoot: Schema.String,
   worktreePath: Schema.NullOr(Schema.String),
+});
+const RunningTurnLookupInput = Schema.Struct({
+  limit: NonNegativeInt,
+});
+const ProjectionRunningTurnRowSchema = Schema.Struct({
+  threadId: ThreadId,
+  turnId: TurnId,
 });
 const FullThreadDiffContextLookupInput = Schema.Struct({
   threadId: ThreadId,
@@ -918,6 +926,25 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         WHERE thread_id = ${threadId}
           AND checkpoint_turn_count IS NOT NULL
         ORDER BY checkpoint_turn_count ASC
+      `,
+  });
+
+  const listRunningTurnRows = SqlSchema.findAll({
+    Request: RunningTurnLookupInput,
+    Result: ProjectionRunningTurnRowSchema,
+    execute: ({ limit }) =>
+      sql`
+        SELECT
+          turns.thread_id AS "threadId",
+          turns.turn_id AS "turnId"
+        FROM projection_turns AS turns
+        INNER JOIN projection_threads AS threads
+          ON threads.thread_id = turns.thread_id
+        WHERE turns.state = 'running'
+          AND turns.turn_id IS NOT NULL
+          AND threads.deleted_at IS NULL
+        ORDER BY turns.thread_id ASC, turns.turn_id ASC
+        LIMIT ${limit}
       `,
   });
 
@@ -1806,6 +1833,30 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         Effect.map(Option.map((row) => row.threadId)),
       );
 
+  const listRunningTurns: ProjectionSnapshotQueryShape["listRunningTurns"] = (limit) =>
+    listRunningTurnRows({ limit }).pipe(
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "ProjectionSnapshotQuery.listRunningTurns:query",
+          "ProjectionSnapshotQuery.listRunningTurns:decodeRows",
+        ),
+      ),
+      Effect.map((rows) =>
+        rows.map((row): ProjectionRunningTurn => ({ threadId: row.threadId, turnId: row.turnId })),
+      ),
+    );
+
+  const getThreadSessionById: ProjectionSnapshotQueryShape["getThreadSessionById"] = (threadId) =>
+    getThreadSessionRowByThread({ threadId }).pipe(
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "ProjectionSnapshotQuery.getThreadSessionById:query",
+          "ProjectionSnapshotQuery.getThreadSessionById:decodeRow",
+        ),
+      ),
+      Effect.map(Option.map(mapSessionRow)),
+    );
+
   const getThreadCheckpointContext: ProjectionSnapshotQueryShape["getThreadCheckpointContext"] = (
     threadId,
   ) =>
@@ -2119,6 +2170,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     getActiveProjectByWorkspaceRoot,
     getProjectShellById,
     getFirstActiveThreadIdByProjectId,
+    listRunningTurns,
+    getThreadSessionById,
     getThreadCheckpointContext,
     getFullThreadDiffContext,
     getThreadShellById,

@@ -1,3 +1,4 @@
+import { TURN_RESTART_INTERRUPTED_ACTIVITY_KIND } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 import {
   computeStableMessagesTimelineRows,
@@ -539,6 +540,87 @@ describe("deriveMessagesTimelineRows", () => {
     expect(
       expandedRows.find((row) => row.kind === "turn-fold" && row.expanded === true),
     ).toBeDefined();
+  });
+
+  it("keeps the restart notice visible on a folded turn as its own row", () => {
+    // Boot-time reconciliation settles the turn and clears the thread's active
+    // turn, so the notice is the only surviving report that the reply was cut
+    // short. Nothing is expanded here — this mirrors a cold page load.
+    const timelineEntries = [
+      {
+        id: "user-entry",
+        kind: "message" as const,
+        createdAt: "2026-01-01T00:00:00Z",
+        message: {
+          id: "user-1" as never,
+          role: "user" as const,
+          text: "Build it",
+          turnId: null,
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          streaming: false,
+        },
+      },
+      {
+        id: "work-entry-1",
+        kind: "work" as const,
+        createdAt: "2026-01-01T00:00:08Z",
+        entry: {
+          id: "work-1",
+          createdAt: "2026-01-01T00:00:08Z",
+          turnId: "turn-1" as never,
+          label: "Ran command",
+          tone: "tool" as const,
+        },
+      },
+      {
+        id: "assistant-partial-entry",
+        kind: "message" as const,
+        createdAt: "2026-01-01T00:00:20Z",
+        message: {
+          id: "assistant-partial" as never,
+          role: "assistant" as const,
+          text: "Halfway through the",
+          turnId: "turn-1" as never,
+          createdAt: "2026-01-01T00:00:20Z",
+          updatedAt: "2026-01-01T00:00:22Z",
+          streaming: false,
+        },
+      },
+      {
+        id: "restart-notice-entry",
+        kind: "work" as const,
+        createdAt: "2026-01-01T00:00:23Z",
+        entry: {
+          id: "restart-notice-1",
+          createdAt: "2026-01-01T00:00:23Z",
+          turnId: "turn-1" as never,
+          label: "Watchman restarted while working on this.",
+          tone: "info" as const,
+          sourceActivityKind: TURN_RESTART_INTERRUPTED_ACTIVITY_KIND,
+        },
+      },
+    ];
+
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+
+    expect(rows.map((row) => row.id)).toEqual([
+      "user-entry",
+      "turn-fold:turn-1",
+      "assistant-partial-entry",
+      "restart-notice-entry",
+    ]);
+    const noticeRow = rows.find(
+      (row): row is Extract<(typeof rows)[number], { kind: "restart-notice" }> =>
+        row.kind === "restart-notice",
+    );
+    expect(noticeRow?.text).toBe("Watchman restarted while working on this.");
   });
 
   it("derives a sane duration for a steer-superseded turn with one instant commentary message", () => {

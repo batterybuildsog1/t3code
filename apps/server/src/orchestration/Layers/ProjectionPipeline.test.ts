@@ -1432,6 +1432,120 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
     }),
   );
 
+  it.effect("settles a running turn when a session goes interrupted with no active turn", () =>
+    // This is the settler that boot-time turn reconciliation reuses: a
+    // container destroyed mid-turn leaves a running turn behind, and the
+    // reconciliation phase replays exactly this event shape rather than
+    // introducing a second way to settle turns.
+    Effect.gen(function* () {
+      const projectionPipeline = yield* OrchestrationProjectionPipeline;
+      const eventStore = yield* OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const now = "2026-01-01T00:00:00.000Z";
+      const executorLastSeenAt = "2026-01-01T00:23:00.000Z";
+      const threadId = ThreadId.make("thread-turn-boot-reconcile");
+      const turnId = TurnId.make("turn-boot-reconcile");
+
+      yield* eventStore.append({
+        type: "thread.created",
+        eventId: EventId.make("evt-br1"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: now,
+        commandId: CommandId.make("cmd-br1"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-br1"),
+        metadata: {},
+        payload: {
+          threadId,
+          projectId: ProjectId.make("project-turn-boot-reconcile"),
+          title: "Boot reconcile",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("opencode"),
+            model: "big-pickle",
+          },
+          runtimeMode: "full-access",
+          branch: null,
+          worktreePath: null,
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+
+      yield* eventStore.append({
+        type: "thread.session-set",
+        eventId: EventId.make("evt-br2"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-01-01T00:00:01.000Z",
+        commandId: CommandId.make("cmd-br2"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-br2"),
+        metadata: {},
+        payload: {
+          threadId,
+          session: {
+            threadId,
+            status: "running",
+            providerName: "opencode",
+            runtimeMode: "full-access",
+            activeTurnId: turnId,
+            lastError: null,
+            updatedAt: "2026-01-01T00:00:01.000Z",
+          },
+        },
+      });
+
+      yield* eventStore.append({
+        type: "thread.session-set",
+        eventId: EventId.make("evt-br3"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-01-01T06:00:00.000Z",
+        commandId: CommandId.make("cmd-br3"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-br3"),
+        metadata: {},
+        payload: {
+          threadId,
+          session: {
+            threadId,
+            status: "interrupted",
+            providerName: "opencode",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: executorLastSeenAt,
+          },
+        },
+      });
+
+      yield* projectionPipeline.bootstrap;
+
+      const turnRows = yield* sql<{
+        readonly state: string;
+        readonly completedAt: string | null;
+      }>`
+        SELECT state, completed_at AS "completedAt"
+        FROM projection_turns
+        WHERE thread_id = ${threadId} AND turn_id = ${turnId}
+      `;
+      // completedAt comes from the session timestamp, not from the boot that
+      // noticed the death six hours later.
+      assert.deepEqual(turnRows, [{ state: "interrupted", completedAt: executorLastSeenAt }]);
+
+      // Clearing the active turn also clears the thread's latest turn, so the
+      // settled turn leaves the thread shell entirely — which is why the
+      // client-side restart notice is the only remaining report.
+      const threadRows = yield* sql<{ readonly latestTurnId: string | null }>`
+        SELECT latest_turn_id AS "latestTurnId"
+        FROM projection_threads
+        WHERE thread_id = ${threadId}
+      `;
+      assert.deepEqual(threadRows, [{ latestTurnId: null }]);
+    }),
+  );
+
   it.effect("settles a superseded running turn when a new turn becomes active", () =>
     Effect.gen(function* () {
       const projectionPipeline = yield* OrchestrationProjectionPipeline;

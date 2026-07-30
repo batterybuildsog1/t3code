@@ -7,7 +7,12 @@ import {
   type WorkLogEntry,
 } from "../../session-logic";
 import { type ChatMessage, type ProposedPlan, type TurnDiffSummary } from "../../types";
-import { type MessageId, type OrchestrationLatestTurn, type TurnId } from "@t3tools/contracts";
+import {
+  type MessageId,
+  type OrchestrationLatestTurn,
+  TURN_RESTART_INTERRUPTED_ACTIVITY_KIND,
+  type TurnId,
+} from "@t3tools/contracts";
 
 export const MAX_VISIBLE_WORK_LOG_ENTRIES = 1;
 export const TIMELINE_MINIMAP_ITEM_SPACING = 8;
@@ -175,7 +180,26 @@ export type MessagesTimelineRow =
       createdAt: string;
       proposedPlan: ProposedPlan;
     }
+  | {
+      kind: "restart-notice";
+      id: string;
+      createdAt: string;
+      text: string;
+    }
   | { kind: "working"; id: string; createdAt: string | null };
+
+/**
+ * A turn settled by boot-time reconciliation leaves the thread shell entirely
+ * (settling clears the active turn), so its restart notice is the only report
+ * the user gets that the reply was cut short. It therefore renders as its own
+ * row instead of a work-log line, and the turn fold never hides it.
+ */
+function timelineEntryIsRestartNotice(entry: TimelineEntry): boolean {
+  return (
+    entry.kind === "work" &&
+    entry.entry.sourceActivityKind === TURN_RESTART_INTERRUPTED_ACTIVITY_KIND
+  );
+}
 
 export interface StableMessagesTimelineRowsState {
   byId: Map<string, MessagesTimelineRow>;
@@ -352,7 +376,7 @@ function deriveTurnFolds(input: {
     }
     const hiddenEntryIds = new Set<string>();
     for (const entry of group.entries) {
-      if (entry.id !== group.terminalEntry?.id) {
+      if (entry.id !== group.terminalEntry?.id && !timelineEntryIsRestartNotice(entry)) {
         hiddenEntryIds.add(entry.id);
       }
     }
@@ -459,6 +483,16 @@ export function deriveMessagesTimelineRows(input: {
       continue;
     }
 
+    if (timelineEntry.kind === "work" && timelineEntryIsRestartNotice(timelineEntry)) {
+      nextRows.push({
+        kind: "restart-notice",
+        id: timelineEntry.id,
+        createdAt: timelineEntry.createdAt,
+        text: timelineEntry.entry.label,
+      });
+      continue;
+    }
+
     if (timelineEntry.kind === "work") {
       const groupedEntries = [timelineEntry.entry];
       let cursor = index + 1;
@@ -467,6 +501,7 @@ export function deriveMessagesTimelineRows(input: {
         if (
           !nextEntry ||
           nextEntry.kind !== "work" ||
+          timelineEntryIsRestartNotice(nextEntry) ||
           collapsedEntryIds.has(nextEntry.id) ||
           foldsByAnchorEntryId.has(nextEntry.id)
         ) {
@@ -605,6 +640,11 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
     case "turn-fold": {
       const bf = b as typeof a;
       return a.createdAt === bf.createdAt && a.label === bf.label && a.expanded === bf.expanded;
+    }
+
+    case "restart-notice": {
+      const br = b as typeof a;
+      return a.createdAt === br.createdAt && a.text === br.text;
     }
 
     case "proposed-plan":

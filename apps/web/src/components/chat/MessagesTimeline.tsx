@@ -861,6 +861,7 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
         <AssistantTimelineRow row={row} />
       ) : null}
       {row.kind === "proposed-plan" ? <ProposedPlanTimelineRow row={row} /> : null}
+      {row.kind === "restart-notice" ? <RestartNoticeTimelineRow row={row} /> : null}
       {row.kind === "working" ? <WorkingTimelineRow row={row} /> : null}
     </div>
   );
@@ -1012,6 +1013,23 @@ function TurnFoldTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "turn-
         <Icon className="size-3.5" />
       </button>
     </div>
+  );
+}
+
+/**
+ * A turn cut short by a server restart is settled without an active turn, so
+ * neither the turn state nor the fold label survives to report it. This row is
+ * the report — it must stay readable on a cold load with nothing expanded.
+ */
+function RestartNoticeTimelineRow({
+  row,
+}: {
+  row: Extract<TimelineRow, { kind: "restart-notice" }>;
+}) {
+  return (
+    <p className="px-1 text-muted-foreground text-xs leading-5" role="status">
+      {row.text}
+    </p>
   );
 }
 

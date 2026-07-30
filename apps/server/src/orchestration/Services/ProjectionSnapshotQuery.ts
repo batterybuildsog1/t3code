@@ -12,12 +12,14 @@ import type {
   OrchestrationProject,
   OrchestrationProjectShell,
   OrchestrationReadModel,
+  OrchestrationSession,
   OrchestrationShellSnapshot,
   OrchestrationThread,
   OrchestrationThreadDetailSnapshot,
   OrchestrationThreadShell,
   ProjectId,
   ThreadId,
+  TurnId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Option from "effect/Option";
@@ -40,6 +42,11 @@ export interface ProjectionThreadCheckpointContext {
   readonly workspaceRoot: string;
   readonly worktreePath: string | null;
   readonly checkpoints: ReadonlyArray<OrchestrationCheckpointSummary>;
+}
+
+export interface ProjectionRunningTurn {
+  readonly threadId: ThreadId;
+  readonly turnId: TurnId;
 }
 
 export interface ProjectionFullThreadDiffContext {
@@ -128,6 +135,30 @@ export interface ProjectionSnapshotQueryShape {
   readonly getFirstActiveThreadIdByProjectId: (
     projectId: ProjectId,
   ) => Effect.Effect<Option.Option<ThreadId>, ProjectionRepositoryError>;
+
+  /**
+   * Read every concrete turn row still recorded as `running` on a
+   * non-deleted thread, ordered deterministically and capped at `limit`.
+   *
+   * Deliberately not derived from `projection_threads.latest_turn_id`: turn
+   * settling is per-turn and a thread can hold more than one running turn, so
+   * the latest-turn joins would under-report. Pending-start placeholder rows
+   * (`turn_id IS NULL`) are excluded because they carry no turn to settle.
+   */
+  readonly listRunningTurns: (
+    limit: number,
+  ) => Effect.Effect<ReadonlyArray<ProjectionRunningTurn>, ProjectionRepositoryError>;
+
+  /**
+   * Read a thread's session row on its own.
+   *
+   * Unlike `getThreadShellById` this does not filter on archive state, so
+   * callers that must act on any live thread (archiving does not stop a
+   * provider session) can still read the session they are about to replace.
+   */
+  readonly getThreadSessionById: (
+    threadId: ThreadId,
+  ) => Effect.Effect<Option.Option<OrchestrationSession>, ProjectionRepositoryError>;
 
   /**
    * Read the checkpoint context needed to resolve a single thread diff.
