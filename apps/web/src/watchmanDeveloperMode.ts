@@ -42,11 +42,10 @@ export function resolveWatchmanNewConversationModelSelection(input: {
  * This is a remembered household mode switch, not an authentication boundary.
  * Control's real boundary remains the fail-closed OpenCode/MCP permissions.
  */
-export function ensureWatchmanDeveloperModeUnlocked(
+export function isWatchmanDeveloperModeUnlocked(
   agent: string | undefined,
   input: {
     storage?: UnlockStorage | null;
-    requestPasscode?: () => string | null;
   } = {},
 ): boolean {
   if (agent !== WATCHMAN_DEVELOPER_AGENT) {
@@ -60,11 +59,19 @@ export function ensureWatchmanDeveloperModeUnlocked(
   } catch {
     // A disabled storage backend simply means the passcode is not remembered.
   }
-  const requestPasscode =
-    input.requestPasscode ?? (() => globalThis.prompt("Enter the Watchman Developer passcode"));
-  if (requestPasscode() !== "24759") {
+  return false;
+}
+
+export function tryUnlockWatchmanDeveloperMode(
+  passcode: string,
+  input: {
+    storage?: UnlockStorage | null;
+  } = {},
+): boolean {
+  if (passcode !== "24759") {
     return false;
   }
+  const storage = input.storage === undefined ? browserStorage() : input.storage;
   try {
     storage?.setItem(WATCHMAN_DEVELOPER_UNLOCK_KEY, "true");
   } catch {
@@ -73,8 +80,8 @@ export function ensureWatchmanDeveloperModeUnlocked(
   return true;
 }
 
-export function ensureWatchmanDeveloperSelectionUnlocked(
+export function isWatchmanDeveloperSelectionUnlocked(
   modelSelection: Pick<ModelSelection, "options">,
 ): boolean {
-  return ensureWatchmanDeveloperModeUnlocked(selectedWatchmanAgent(modelSelection));
+  return isWatchmanDeveloperModeUnlocked(selectedWatchmanAgent(modelSelection));
 }

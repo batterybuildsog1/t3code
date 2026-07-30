@@ -48,6 +48,7 @@ type TraitsRenderInput = {
   modelOptions: ReadonlyArray<ProviderOptionSelection> | undefined;
   prompt: string;
   onPromptChange: (prompt: string) => void;
+  onWatchmanUnlockRequired?: (applySelection: () => void) => void;
 };
 
 export function getComposerPromptInjectionState(prompt: string): ComposerPromptInjectionState {
@@ -112,6 +113,7 @@ function renderTraitsControl(
     modelOptions,
     prompt,
     onPromptChange,
+    onWatchmanUnlockRequired,
   } = input;
   const hasTarget = threadRef !== undefined || draftId !== undefined;
   if (
@@ -131,6 +133,7 @@ function renderTraitsControl(
       modelOptions={modelOptions}
       prompt={prompt}
       onPromptChange={onPromptChange}
+      {...(onWatchmanUnlockRequired ? { onWatchmanUnlockRequired } : {})}
     />
   );
 }

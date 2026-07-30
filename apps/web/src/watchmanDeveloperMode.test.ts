@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
-  ensureWatchmanDeveloperModeUnlocked,
+  isWatchmanDeveloperModeUnlocked,
   resolveWatchmanNewConversationModelSelection,
   selectedWatchmanAgent,
+  tryUnlockWatchmanDeveloperMode,
   WATCHMAN_DEVELOPER_UNLOCK_KEY,
 } from "./watchmanDeveloperMode";
 
@@ -19,45 +20,21 @@ function makeStorage(initial?: string) {
 
 describe("Watchman Developer mode unlock", () => {
   it("does not gate Control or ordinary OpenCode agents", () => {
-    const requestPasscode = vi.fn(() => null);
-    expect(
-      ensureWatchmanDeveloperModeUnlocked("watchman-control", {
-        storage: null,
-        requestPasscode,
-      }),
-    ).toBe(true);
-    expect(requestPasscode).not.toHaveBeenCalled();
+    expect(isWatchmanDeveloperModeUnlocked("watchman-control", { storage: null })).toBe(true);
   });
 
   it("rejects a wrong passcode without remembering it", () => {
     const storage = makeStorage();
-    expect(
-      ensureWatchmanDeveloperModeUnlocked("watchman-developer", {
-        storage,
-        requestPasscode: () => "wrong",
-      }),
-    ).toBe(false);
+    expect(tryUnlockWatchmanDeveloperMode("wrong", { storage })).toBe(false);
     expect(storage.setItem).not.toHaveBeenCalled();
+    expect(isWatchmanDeveloperModeUnlocked("watchman-developer", { storage })).toBe(false);
   });
 
   it("remembers the correct passcode on the device", () => {
     const storage = makeStorage();
-    expect(
-      ensureWatchmanDeveloperModeUnlocked("watchman-developer", {
-        storage,
-        requestPasscode: () => "24759",
-      }),
-    ).toBe(true);
+    expect(tryUnlockWatchmanDeveloperMode("24759", { storage })).toBe(true);
     expect(storage.setItem).toHaveBeenCalledWith(WATCHMAN_DEVELOPER_UNLOCK_KEY, "true");
-
-    const requestPasscode = vi.fn(() => null);
-    expect(
-      ensureWatchmanDeveloperModeUnlocked("watchman-developer", {
-        storage,
-        requestPasscode,
-      }),
-    ).toBe(true);
-    expect(requestPasscode).not.toHaveBeenCalled();
+    expect(isWatchmanDeveloperModeUnlocked("watchman-developer", { storage })).toBe(true);
   });
 
   it("reads the selected OpenCode agent from native model options", () => {

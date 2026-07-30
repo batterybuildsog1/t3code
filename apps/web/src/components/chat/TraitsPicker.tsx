@@ -31,7 +31,7 @@ import { useComposerDraftStore, DraftId } from "../../composerDraftStore";
 import { getProviderModelCapabilities } from "../../providerModels";
 import { cn } from "~/lib/utils";
 import { Badge } from "../ui/badge";
-import { ensureWatchmanDeveloperModeUnlocked } from "../../watchmanDeveloperMode";
+import { isWatchmanDeveloperModeUnlocked } from "../../watchmanDeveloperMode";
 
 type ProviderOptions = ReadonlyArray<ProviderOptionSelection>;
 
@@ -219,6 +219,7 @@ export interface TraitsMenuContentProps {
   allowPromptInjectedEffort?: boolean;
   triggerVariant?: VariantProps<typeof buttonVariants>["variant"];
   triggerClassName?: string;
+  onWatchmanUnlockRequired?: (applySelection: () => void) => void;
 }
 
 export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
@@ -230,6 +231,7 @@ export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
   onPromptChange,
   modelOptions,
   allowPromptInjectedEffort = true,
+  onWatchmanUnlockRequired,
   ...persistence
 }: TraitsMenuContentProps & TraitsPersistence) {
   const setProviderModelOptions = useComposerDraftStore((store) => store.setProviderModelOptions);
@@ -276,23 +278,27 @@ export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
     value: string,
   ) => {
     if (!value) return;
-    if (descriptor.id === "agent" && !ensureWatchmanDeveloperModeUnlocked(value)) {
+    const applySelection = () => {
+      if (descriptor.promptInjectedValues?.includes(value)) {
+        const nextPrompt =
+          prompt.trim().length === 0
+            ? ULTRATHINK_PROMPT_PREFIX
+            : applyClaudePromptEffortPrefix(prompt, "ultrathink");
+        onPromptChange(nextPrompt);
+        return;
+      }
+      if (ultrathinkInBodyText && descriptor.id === primarySelectDescriptor?.id) return;
+      if (ultrathinkPromptControlled && descriptor.id === primarySelectDescriptor?.id) {
+        const stripped = prompt.replace(/^Ultrathink:\s*/i, "");
+        onPromptChange(stripped);
+      }
+      updateDescriptors(replaceDescriptorCurrentValue(descriptors, descriptor.id, value));
+    };
+    if (descriptor.id === "agent" && !isWatchmanDeveloperModeUnlocked(value)) {
+      onWatchmanUnlockRequired?.(applySelection);
       return;
     }
-    if (descriptor.promptInjectedValues?.includes(value)) {
-      const nextPrompt =
-        prompt.trim().length === 0
-          ? ULTRATHINK_PROMPT_PREFIX
-          : applyClaudePromptEffortPrefix(prompt, "ultrathink");
-      onPromptChange(nextPrompt);
-      return;
-    }
-    if (ultrathinkInBodyText && descriptor.id === primarySelectDescriptor?.id) return;
-    if (ultrathinkPromptControlled && descriptor.id === primarySelectDescriptor?.id) {
-      const stripped = prompt.replace(/^Ultrathink:\s*/i, "");
-      onPromptChange(stripped);
-    }
-    updateDescriptors(replaceDescriptorCurrentValue(descriptors, descriptor.id, value));
+    applySelection();
   };
 
   if (!hasAnyControls) {
@@ -434,6 +440,7 @@ export const TraitsPicker = memo(function TraitsPicker({
   allowPromptInjectedEffort = true,
   triggerVariant,
   triggerClassName,
+  onWatchmanUnlockRequired,
   ...persistence
 }: TraitsMenuContentProps & TraitsPersistence) {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
@@ -519,6 +526,10 @@ export const TraitsPicker = memo(function TraitsPicker({
           onPromptChange={onPromptChange}
           modelOptions={modelOptions}
           allowPromptInjectedEffort={allowPromptInjectedEffort}
+          onWatchmanUnlockRequired={(applySelection) => {
+            setIsMenuOpen(false);
+            onWatchmanUnlockRequired?.(applySelection);
+          }}
           {...persistence}
         />
       </MenuPopup>

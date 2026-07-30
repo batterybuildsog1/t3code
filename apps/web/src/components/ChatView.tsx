@@ -222,6 +222,7 @@ import {
 } from "../state/entities";
 import { environmentShell } from "../state/shell";
 import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
+import { WatchmanDeveloperUnlockDialog } from "./chat/WatchmanDeveloperUnlockDialog";
 import { DraftHeroHeadline } from "./chat/DraftHeroHeadline";
 import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { PullRequestThreadDialog } from "./PullRequestThreadDialog";
@@ -305,7 +306,7 @@ import {
 } from "../versionSkew";
 import { useAssetUrls } from "../assets/assetUrls";
 import {
-  ensureWatchmanDeveloperSelectionUnlocked,
+  isWatchmanDeveloperSelectionUnlocked,
   selectedWatchmanAgent,
   WATCHMAN_CONTROL_AGENT,
   WATCHMAN_CONTROL_PROVIDER_INSTANCE_ID,
@@ -1268,6 +1269,8 @@ function ChatViewContent(props: ChatViewProps) {
   >({});
   const [isConnecting, _setIsConnecting] = useState(false);
   const [isRevertingCheckpoint, setIsRevertingCheckpoint] = useState(false);
+  const [isWatchmanDeveloperUnlockOpen, setIsWatchmanDeveloperUnlockOpen] = useState(false);
+  const pendingWatchmanDeveloperActionRef = useRef<(() => void) | null>(null);
   const [maximizedRightPanelThreadKey, setMaximizedRightPanelThreadKey] = useState<string | null>(
     null,
   );
@@ -1314,6 +1317,10 @@ function ChatViewContent(props: ChatViewProps) {
   const attachmentPreviewPromotionInFlightByMessageIdRef = useRef<Record<string, true>>({});
   const sendInFlightRef = useRef(false);
   const terminalUiOpenByThreadRef = useRef<Record<string, boolean>>({});
+  const requestWatchmanDeveloperUnlock = useCallback((action: () => void) => {
+    pendingWatchmanDeveloperActionRef.current = action;
+    setIsWatchmanDeveloperUnlockOpen(true);
+  }, []);
 
   useLayoutEffect(() => {
     if (!composerOverlayElement) return;
@@ -4496,8 +4503,10 @@ function ChatViewContent(props: ChatViewProps) {
       selectedPromptEffort: ctxSelectedPromptEffort,
       selectedModelSelection: ctxSelectedModelSelection,
     } = sendCtx;
-    if (!ensureWatchmanDeveloperSelectionUnlocked(ctxSelectedModelSelection)) {
-      scheduleComposerFocus();
+    if (!isWatchmanDeveloperSelectionUnlocked(ctxSelectedModelSelection)) {
+      requestWatchmanDeveloperUnlock(() => {
+        void onSend();
+      });
       return;
     }
     const promptForSend = promptRef.current;
@@ -5115,8 +5124,10 @@ function ChatViewContent(props: ChatViewProps) {
         selectedPromptEffort: ctxSelectedPromptEffort,
         selectedModelSelection: ctxSelectedModelSelection,
       } = sendCtx;
-      if (!ensureWatchmanDeveloperSelectionUnlocked(ctxSelectedModelSelection)) {
-        scheduleComposerFocus();
+      if (!isWatchmanDeveloperSelectionUnlocked(ctxSelectedModelSelection)) {
+        requestWatchmanDeveloperUnlock(() => {
+          void onSubmitPlanFollowUp({ text, restoreText, interactionMode: nextInteractionMode });
+        });
         return;
       }
 
@@ -5327,6 +5338,7 @@ function ChatViewContent(props: ChatViewProps) {
       runtimeMode,
       navigate,
       providerStatuses,
+      requestWatchmanDeveloperUnlock,
       scheduleComposerFocus,
       setComposerDraftInteractionMode,
       setComposerDraftModelSelection,
@@ -5364,8 +5376,10 @@ function ChatViewContent(props: ChatViewProps) {
       selectedPromptEffort: ctxSelectedPromptEffort,
       selectedModelSelection: ctxSelectedModelSelection,
     } = sendCtx;
-    if (!ensureWatchmanDeveloperSelectionUnlocked(ctxSelectedModelSelection)) {
-      scheduleComposerFocus();
+    if (!isWatchmanDeveloperSelectionUnlocked(ctxSelectedModelSelection)) {
+      requestWatchmanDeveloperUnlock(() => {
+        void onImplementPlanInNewThread();
+      });
       return;
     }
 
@@ -5496,6 +5510,7 @@ function ChatViewContent(props: ChatViewProps) {
     isServerThread,
     navigate,
     resetLocalDispatch,
+    requestWatchmanDeveloperUnlock,
     runtimeMode,
     scheduleComposerFocus,
     startThreadTurn,
@@ -5994,6 +6009,7 @@ function ChatViewContent(props: ChatViewProps) {
                               onChangeActivePendingUserInputCustomAnswer
                             }
                             onProviderModelSelect={onProviderModelSelect}
+                            onWatchmanUnlockRequired={requestWatchmanDeveloperUnlock}
                             getModelDisabledReason={getModelDisabledReason}
                             toggleInteractionMode={toggleInteractionMode}
                             handleRuntimeModeChange={handleRuntimeModeChange}
@@ -6090,6 +6106,21 @@ function ChatViewContent(props: ChatViewProps) {
                 </AlertDialogFooter>
               </AlertDialogPopup>
             </AlertDialog>
+
+            <WatchmanDeveloperUnlockDialog
+              open={isWatchmanDeveloperUnlockOpen}
+              onUnlocked={() => {
+                setIsWatchmanDeveloperUnlockOpen(false);
+                const action = pendingWatchmanDeveloperActionRef.current;
+                pendingWatchmanDeveloperActionRef.current = null;
+                action?.();
+              }}
+              onCancel={() => {
+                pendingWatchmanDeveloperActionRef.current = null;
+                setIsWatchmanDeveloperUnlockOpen(false);
+                scheduleComposerFocus();
+              }}
+            />
 
             {pullRequestDialogState ? (
               <PullRequestThreadDialog

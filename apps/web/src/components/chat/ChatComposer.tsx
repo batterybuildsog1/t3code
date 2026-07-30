@@ -615,6 +615,7 @@ export interface ChatComposerProps {
   ) => void;
 
   onProviderModelSelect: (instanceId: ProviderInstanceId, model: string) => void;
+  onWatchmanUnlockRequired: (action: () => void) => void;
   getModelDisabledReason?: (instanceId: ProviderInstanceId, model: string) => string | null;
   toggleInteractionMode: () => void;
   handleRuntimeModeChange: (mode: RuntimeMode) => void;
@@ -691,6 +692,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     onPreviousActivePendingUserInputQuestion,
     onChangeActivePendingUserInputCustomAnswer,
     onProviderModelSelect,
+    onWatchmanUnlockRequired,
     getModelDisabledReason,
     toggleInteractionMode,
     handleRuntimeModeChange,
@@ -706,6 +708,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // Store subscriptions (prompt / images / terminal contexts)
   // ------------------------------------------------------------------
   const composerDraft = useComposerThreadDraft(composerDraftTarget);
+  const [isCompactControlsMenuOpen, setIsCompactControlsMenuOpen] = useState(false);
   const prompt = composerDraft.prompt;
   const composerImages = composerDraft.images;
   const composerTerminalContexts = composerDraft.terminalContexts;
@@ -1212,6 +1215,22 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     },
     [composerDraftTarget, promptRef, scheduleComposerFocus, setComposerDraftPrompt],
   );
+  const requestWatchmanDeveloperSelectionUnlock = useCallback(
+    (applySelection: () => void) => {
+      onWatchmanUnlockRequired(() => {
+        applySelection();
+        scheduleComposerFocus();
+      });
+    },
+    [onWatchmanUnlockRequired, scheduleComposerFocus],
+  );
+  const requestCompactWatchmanDeveloperSelectionUnlock = useCallback(
+    (applySelection: () => void) => {
+      setIsCompactControlsMenuOpen(false);
+      requestWatchmanDeveloperSelectionUnlock(applySelection);
+    },
+    [requestWatchmanDeveloperSelectionUnlock],
+  );
 
   const providerTraitsMenuContent = renderProviderTraitsMenuContent({
     provider: selectedProvider,
@@ -1223,6 +1242,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     modelOptions: composerModelOptions?.[selectedInstanceId],
     prompt,
     onPromptChange: setPromptFromTraits,
+    onWatchmanUnlockRequired: requestCompactWatchmanDeveloperSelectionUnlock,
   });
   const providerTraitsPicker = renderProviderTraitsPicker({
     provider: selectedProvider,
@@ -1234,6 +1254,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     modelOptions: composerModelOptions?.[selectedInstanceId],
     prompt,
     onPromptChange: setPromptFromTraits,
+    onWatchmanUnlockRequired: requestWatchmanDeveloperSelectionUnlock,
   });
   const pendingPrimaryAction = useMemo(
     () =>
@@ -3123,6 +3144,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   <CompactComposerControlsMenu
                     activePlan={showPlanSidebarToggle}
                     interactionMode={interactionMode}
+                    open={isCompactControlsMenuOpen}
                     {...(composerProviderState.watchmanAgentLabel
                       ? { label: composerProviderState.watchmanAgentLabel }
                       : {})}
@@ -3131,6 +3153,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     runtimeMode={runtimeMode}
                     showInteractionModeToggle={composerProviderControls.showInteractionModeToggle}
                     traitsMenuContent={providerTraitsMenuContent}
+                    onOpenChange={setIsCompactControlsMenuOpen}
                     onToggleInteractionMode={toggleInteractionMode}
                     onTogglePlanSidebar={togglePlanSidebar}
                     onRuntimeModeChange={handleRuntimeModeChange}
