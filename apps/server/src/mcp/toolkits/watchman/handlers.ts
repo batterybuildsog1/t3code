@@ -1157,7 +1157,21 @@ const waterControl = Effect.fn("WatchmanToolkit.waterControl")(function* (input:
     });
   }
 
-  const states = yield* readStates(tool);
+  let states = yield* readStates(tool);
+  if (
+    isLimitMutation &&
+    requestId !== undefined &&
+    states.get("sensor.watchman_drive_snapshot")?.attributes.operator_limit_request_id !== requestId
+  ) {
+    // The HA command-line sensor normally scans every 15 seconds. Give the
+    // 1 Hz poller one bounded publish window, then force exactly one refresh;
+    // never turn a model retry into a second physical command.
+    yield* Effect.sleep(Duration.millis(1_200));
+    yield* callService(tool, "homeassistant", "update_entity", {
+      entity_id: "sensor.watchman_drive_snapshot",
+    }).pipe(Effect.ignore);
+    states = yield* readStates(tool);
+  }
   const drive = states.get("sensor.watchman_drive_snapshot");
   const requestedMode =
     input.operation === "hold" ? "hold" : input.operation === "automatic" ? "release" : undefined;
@@ -1173,6 +1187,7 @@ const waterControl = Effect.fn("WatchmanToolkit.waterControl")(function* (input:
   const observedOperatorLimit = drive?.attributes.operator_limit_hz;
   const observedOperatorRequestId = drive?.attributes.operator_limit_request_id;
   const observedOperatorAction = drive?.attributes.operator_limit_action;
+  const observedOperatorExpiresAt = drive?.attributes.operator_limit_expires_at;
   const observedPressureLimit = drive?.attributes.pressure_limit_hz;
   const observedEffectiveCap = drive?.attributes.effective_cap_hz;
   const observedPhysicalCap = drive?.attributes.pressure_cap_hz;
@@ -1182,12 +1197,7 @@ const waterControl = Effect.fn("WatchmanToolkit.waterControl")(function* (input:
     drive.attributes.mode === "poller-v3" &&
     observedOperatorRequestId === requestId &&
     snapshotFresh;
-  const operatorLimitVerified =
-    requestedOperatorLimit !== undefined &&
-    correlatedLimitReceipt &&
-    observedOperatorAction === "set" &&
-    observedOperatorActive === true &&
-    observedOperatorLimit === requestedOperatorLimit &&
+  const capStateInternallyConsistent =
     typeof observedPressureLimit === "number" &&
     Number.isFinite(observedPressureLimit) &&
     observedPressureLimit >= 102 &&
@@ -1195,17 +1205,48 @@ const waterControl = Effect.fn("WatchmanToolkit.waterControl")(function* (input:
     typeof observedEffectiveCap === "number" &&
     Number.isFinite(observedEffectiveCap) &&
     observedEffectiveCap >= 102 &&
-    observedEffectiveCap <= requestedOperatorLimit &&
     observedEffectiveCap <= observedPressureLimit &&
     typeof observedPhysicalCap === "number" &&
     Number.isFinite(observedPhysicalCap) &&
-    observedPhysicalCap >= 102 &&
-    observedPhysicalCap <= observedEffectiveCap;
+    Math.abs(observedPhysicalCap - observedEffectiveCap) <= 0.01;
+  const expectedEffectiveCap =
+    input.operation === "set_operator_limit" &&
+    typeof requestedOperatorLimit === "number" &&
+    typeof observedPressureLimit === "number"
+      ? Math.min(observedPressureLimit, requestedOperatorLimit)
+      : input.operation === "clear_operator_limit" && typeof observedPressureLimit === "number"
+        ? observedPressureLimit
+        : undefined;
+  const capsAppliedConsistently =
+    capStateInternallyConsistent &&
+    typeof expectedEffectiveCap === "number" &&
+    typeof observedEffectiveCap === "number" &&
+    Math.abs(observedEffectiveCap - expectedEffectiveCap) <= 0.01;
+  const requestedDurationSeconds = (input.minutes ?? 60) * 60;
+  const observedExpiryRemainingSeconds =
+    typeof observedOperatorExpiresAt === "number" && Number.isFinite(observedOperatorExpiresAt)
+      ? observedOperatorExpiresAt - nowMs / 1_000
+      : Number.NaN;
+  const operatorDurationVerified =
+    Number.isFinite(observedExpiryRemainingSeconds) &&
+    observedExpiryRemainingSeconds >= requestedDurationSeconds - 30 &&
+    observedExpiryRemainingSeconds <= requestedDurationSeconds + 5;
+  const operatorLimitVerified =
+    requestedOperatorLimit !== undefined &&
+    correlatedLimitReceipt &&
+    observedOperatorAction === "set" &&
+    observedOperatorActive === true &&
+    observedOperatorLimit === requestedOperatorLimit &&
+    operatorDurationVerified &&
+    capsAppliedConsistently &&
+    typeof observedEffectiveCap === "number" &&
+    observedEffectiveCap <= requestedOperatorLimit;
   const operatorClearVerified =
     input.operation === "clear_operator_limit" &&
     correlatedLimitReceipt &&
     observedOperatorAction === "clear" &&
-    observedOperatorActive === false;
+    observedOperatorActive === false &&
+    capsAppliedConsistently;
   const expectedHeld = requestedMode === "hold";
   const controlVerified =
     requestedMode !== undefined &&
@@ -1248,7 +1289,7 @@ const waterControl = Effect.fn("WatchmanToolkit.waterControl")(function* (input:
       ctrl_error: drive?.attributes.ctrl_error,
       operator_limit_active: observedOperatorActive,
       operator_limit_hz: observedOperatorLimit,
-      operator_limit_expires_at: drive?.attributes.operator_limit_expires_at,
+      operator_limit_expires_at: observedOperatorExpiresAt,
       operator_limit_request_id: observedOperatorRequestId,
       pressure_limit_hz: observedPressureLimit,
       effective_cap_hz: observedEffectiveCap,

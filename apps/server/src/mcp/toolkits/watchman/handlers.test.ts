@@ -310,6 +310,16 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
       readWellRunHistory: () => Effect.die("unused"),
       rest: (method, path, payload) => {
         calls.push({ method, path, ...(payload === undefined ? {} : { payload }) });
+        if (method === "POST" && path === "/api/services/shell_command/well_operator_limit_set") {
+          const drive = states.find(
+            ({ entity_id }) => entity_id === "sensor.watchman_drive_snapshot",
+          );
+          if (drive) {
+            drive.attributes.operator_limit_request_id = (
+              payload as { request_id?: string }
+            ).request_id;
+          }
+        }
         return method === "GET" ? freshStates(states) : Effect.succeed([]);
       },
     }),
@@ -721,12 +731,14 @@ it.effect("keeps unproven operator-limit receipts pending", () => {
     readonly attributes: (requestId: string | undefined) => Record<string, unknown>;
     readonly ageSeconds: number;
   };
+  let observedNowSeconds = 0;
   const correlatedAttributes = (requestId: string | undefined): Record<string, unknown> => ({
     mode: "poller-v3",
     pressure_cap_hz: 110,
     pressure_limit_hz: 115,
     operator_limit_active: true,
     operator_limit_hz: 110,
+    operator_limit_expires_at: observedNowSeconds + 3_600,
     operator_limit_request_id: requestId,
     operator_limit_action: "set",
     effective_cap_hz: 110,
@@ -738,17 +750,25 @@ it.effect("keeps unproven operator-limit receipts pending", () => {
     ageSeconds: 31,
   };
   let lastRequestId: string | undefined;
+  let refreshCalls = 0;
+  let shellCommandCalls = 0;
   const CliLayer = Layer.succeed(
     WatchmanHaCli.WatchmanHaCli,
     WatchmanHaCli.WatchmanHaCli.of({
       readWellRunHistory: () => Effect.die("unused"),
       rest: (method, _path, payload) => {
         if (method === "POST") {
-          lastRequestId = (payload as { request_id?: string } | undefined)?.request_id;
+          if (_path === "/api/services/homeassistant/update_entity") refreshCalls += 1;
+          if (_path === "/api/services/shell_command/well_operator_limit_set") {
+            shellCommandCalls += 1;
+          }
+          const requestId = (payload as { request_id?: string } | undefined)?.request_id;
+          if (requestId !== undefined) lastRequestId = requestId;
           return Effect.succeed([]);
         }
         return DateTime.now.pipe(
           Effect.map((now) => {
+            observedNowSeconds = DateTime.toEpochMillis(now) / 1_000;
             const observedAt = DateTime.formatIso(
               DateTime.add(now, { seconds: -receiptCase.ageSeconds }),
             );
@@ -832,6 +852,16 @@ it.effect("keeps unproven operator-limit receipts pending", () => {
       ageSeconds: 0,
     },
     {
+      name: "stale lower cap despite internally matching physical state",
+      driveState: "True",
+      attributes: (requestId) => ({
+        ...correlatedAttributes(requestId),
+        pressure_cap_hz: 109,
+        effective_cap_hz: 109,
+      }),
+      ageSeconds: 0,
+    },
+    {
       name: "mismatched request",
       driveState: "True",
       attributes: () => correlatedAttributes("different-request"),
@@ -856,6 +886,15 @@ it.effect("keeps unproven operator-limit receipts pending", () => {
       ageSeconds: 0,
     },
     {
+      name: "wrong expiry",
+      driveState: "True",
+      attributes: (requestId) => ({
+        ...correlatedAttributes(requestId),
+        operator_limit_expires_at: observedNowSeconds + 600,
+      }),
+      ageSeconds: 0,
+    },
+    {
       name: "offline poller",
       driveState: "False",
       attributes: correlatedAttributes,
@@ -867,7 +906,7 @@ it.effect("keeps unproven operator-limit receipts pending", () => {
     const server = yield* McpServer.McpServer;
     for (const testCase of cases) {
       receiptCase = testCase;
-      const result = yield* server
+      const effect = server
         .callTool({
           name: "watchman_water_control",
           arguments: { operation: "set_operator_limit", max_hz: 110 },
@@ -876,42 +915,62 @@ it.effect("keeps unproven operator-limit receipts pending", () => {
           Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
           Effect.provideService(McpSchema.McpServerClient, client),
         );
+      const result =
+        testCase.name === "mismatched request"
+          ? yield* Effect.gen(function* () {
+              const fiber = yield* Effect.forkChild(effect, { startImmediately: true });
+              yield* TestClock.adjust("2 seconds");
+              return yield* Fiber.join(fiber);
+            })
+          : yield* effect;
       expect(result.isError, testCase.name).toBe(false);
       expect(result.structuredContent, testCase.name).toMatchObject({
         accepted: true,
         applied: "pending",
       });
     }
+    expect(refreshCalls).toBe(1);
+    expect(shellCommandCalls).toBe(cases.length);
   }).pipe(Effect.provide(TestLayer));
 });
 
 it.effect("verifies request-correlated operator-limit set and clear receipts", () => {
   let lastPath = "";
   let lastPayload: Record<string, unknown> = {};
+  let observedEffectiveCap = 108;
+  let observedPhysicalCap = 108;
   const CliLayer = Layer.succeed(
     WatchmanHaCli.WatchmanHaCli,
     WatchmanHaCli.WatchmanHaCli.of({
       readWellRunHistory: () => Effect.die("unused"),
       rest: (method, path, payload) => {
         if (method === "POST") {
-          lastPath = path;
-          lastPayload = (payload ?? {}) as Record<string, unknown>;
+          if (path.includes("/shell_command/")) {
+            lastPath = path;
+            lastPayload = (payload ?? {}) as Record<string, unknown>;
+          }
           return Effect.succeed([]);
         }
         const cleared = lastPath.endsWith("/well_operator_limit_clear");
-        return freshStates([
-          state("sensor.watchman_drive_snapshot", "True", {
-            mode: "poller-v3",
-            pressure_cap_hz: 108,
-            pressure_limit_hz: 108,
-            operator_limit_active: !cleared,
-            operator_limit_hz: cleared ? null : 110,
-            operator_limit_expires_at: cleared ? null : 1_800_000_000,
-            operator_limit_request_id: lastPayload.request_id,
-            operator_limit_action: cleared ? "clear" : "set",
-            effective_cap_hz: 108,
-          }),
-        ]);
+        return DateTime.now.pipe(
+          Effect.flatMap((now) =>
+            freshStates([
+              state("sensor.watchman_drive_snapshot", "True", {
+                mode: "poller-v3",
+                pressure_cap_hz: observedPhysicalCap,
+                pressure_limit_hz: 108,
+                operator_limit_active: !cleared,
+                operator_limit_hz: cleared ? null : 110,
+                operator_limit_expires_at: cleared
+                  ? null
+                  : DateTime.toEpochMillis(now) / 1_000 + Number(lastPayload.minutes) * 60,
+                operator_limit_request_id: lastPayload.request_id,
+                operator_limit_action: cleared ? "clear" : "set",
+                effective_cap_hz: observedEffectiveCap,
+              }),
+            ]),
+          ),
+        );
       },
     }),
   );
@@ -953,6 +1012,34 @@ it.effect("verifies request-correlated operator-limit set and clear receipts", (
       },
     });
 
+    observedPhysicalCap = 107;
+    const mismatchedPhysicalClear = yield* call({ operation: "clear_operator_limit" });
+    expect(mismatchedPhysicalClear.isError).toBe(false);
+    expect(mismatchedPhysicalClear.structuredContent).toMatchObject({
+      applied: "pending",
+      safety: {
+        operator_limit_active: false,
+        pressure_limit_hz: 108,
+        effective_cap_hz: 108,
+        actual_id102_cap_hz: 107,
+      },
+    });
+
+    observedEffectiveCap = 107;
+    const staleLowerClear = yield* call({ operation: "clear_operator_limit" });
+    expect(staleLowerClear.isError).toBe(false);
+    expect(staleLowerClear.structuredContent).toMatchObject({
+      applied: "pending",
+      safety: {
+        operator_limit_active: false,
+        pressure_limit_hz: 108,
+        effective_cap_hz: 107,
+        actual_id102_cap_hz: 107,
+      },
+    });
+
+    observedEffectiveCap = 108;
+    observedPhysicalCap = 108;
     const clear = yield* call({ operation: "clear_operator_limit" });
     expect(clear.isError).toBe(false);
     expect(lastPath).toBe("/api/services/shell_command/well_operator_limit_clear");
@@ -1916,40 +2003,52 @@ it.effect("lets tvd own policy and blocks stale health or file collisions", () =
 it.effect("serializes Watchman mutations across concurrent tool calls", () => {
   let activePosts = 0;
   let maxActivePosts = 0;
+  let lastRequestId: string | undefined;
   const CliLayer = Layer.succeed(
     WatchmanHaCli.WatchmanHaCli,
     WatchmanHaCli.WatchmanHaCli.of({
       readWellRunHistory: () => Effect.die("unused"),
-      rest: (method) =>
-        method === "GET"
-          ? freshStates([
-              state("sensor.watchman_drive_snapshot", "True", {
-                mode: "poller-v3",
-                pressure_cap_hz: 110,
-                pressure_limit_hz: 115,
-                operator_limit_active: true,
-                operator_limit_hz: 110,
-                effective_cap_hz: 110,
-                ctrl_requested_mode: "hold",
-                ctrl_applied_mode: "hold",
-                ctrl_ack: true,
-                ctrl_error: null,
-                ctrl_held: true,
-                ctrl_command_age_s: 1,
-              }),
-            ])
-          : Effect.gen(function* () {
-              activePosts += 1;
-              maxActivePosts = Math.max(maxActivePosts, activePosts);
-              yield* Effect.yieldNow;
-              return [];
-            }).pipe(
-              Effect.ensuring(
-                Effect.sync(() => {
-                  activePosts -= 1;
+      rest: (method, _path, payload) => {
+        if (method === "GET") {
+          return DateTime.now.pipe(
+            Effect.flatMap((now) =>
+              freshStates([
+                state("sensor.watchman_drive_snapshot", "True", {
+                  mode: "poller-v3",
+                  pressure_cap_hz: 110,
+                  pressure_limit_hz: 115,
+                  operator_limit_active: true,
+                  operator_limit_hz: 110,
+                  operator_limit_expires_at: DateTime.toEpochMillis(now) / 1_000 + 3_600,
+                  operator_limit_request_id: lastRequestId,
+                  operator_limit_action: "set",
+                  effective_cap_hz: 110,
+                  ctrl_requested_mode: "hold",
+                  ctrl_applied_mode: "hold",
+                  ctrl_ack: true,
+                  ctrl_error: null,
+                  ctrl_held: true,
+                  ctrl_command_age_s: 1,
                 }),
-              ),
+              ]),
             ),
+          );
+        }
+        return Effect.gen(function* () {
+          const requestId = (payload as { request_id?: string } | undefined)?.request_id;
+          if (requestId !== undefined) lastRequestId = requestId;
+          activePosts += 1;
+          maxActivePosts = Math.max(maxActivePosts, activePosts);
+          yield* Effect.yieldNow;
+          return [];
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              activePosts -= 1;
+            }),
+          ),
+        );
+      },
     }),
   );
   const TestLayer = McpServer.toolkit(WatchmanToolkit).pipe(
