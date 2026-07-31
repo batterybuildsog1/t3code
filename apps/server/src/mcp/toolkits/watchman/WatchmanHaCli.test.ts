@@ -30,9 +30,10 @@ it.effect("passes exact REST arguments to the existing watchman-ha helper", () =
   return Effect.gen(function* () {
     const cli = yield* WatchmanHaCli.WatchmanHaCli;
     expect(
-      yield* cli.rest("POST", "/api/services/input_number/set_value", {
-        entity_id: "input_number.well_user_max_hz",
-        value: 110,
+      yield* cli.rest("POST", "/api/services/shell_command/well_operator_limit_set", {
+        max_hz: 110,
+        minutes: 60,
+        request_id: "test-request",
       }),
     ).toEqual({ ok: true });
     expect(invocations).toHaveLength(1);
@@ -41,8 +42,8 @@ it.effect("passes exact REST arguments to the existing watchman-ha helper", () =
       args: [
         "rest",
         "POST",
-        "/api/services/input_number/set_value",
-        '{"entity_id":"input_number.well_user_max_hz","value":110}',
+        "/api/services/shell_command/well_operator_limit_set",
+        '{"max_hz":110,"minutes":60,"request_id":"test-request"}',
       ],
       timeout: "30 seconds",
     });

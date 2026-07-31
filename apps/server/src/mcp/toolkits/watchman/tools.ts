@@ -67,8 +67,9 @@ const hvacParameters = Schema.Struct({
 }).annotate(strictParameters);
 
 const waterParameters = Schema.Struct({
-  operation: Schema.Literals(["set_speed_cap", "hold", "automatic"]),
-  max_hz: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 102, maximum: 115 }))),
+  operation: Schema.Literals(["set_operator_limit", "clear_operator_limit", "hold", "automatic"]),
+  max_hz: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 102, maximum: 114 }))),
+  minutes: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 240 }))),
 }).annotate(strictParameters);
 
 export class WatchmanControlError extends Schema.TaggedErrorClass<WatchmanControlError>()(
@@ -153,7 +154,7 @@ export const WatchmanHvacControlTool = mutationTool(
 export const WatchmanWaterControlTool = mutationTool(
   Tool.make("watchman_water_control", {
     description:
-      "Set the well user speed ceiling from 102-115 Hz, request a controller-owned HOLD, or return authority to automatic/native-solar operation. Automatic is not start-now. This never writes Modbus or live control files.",
+      "Set or clear a temporary 102-114 Hz well operator limit, request a controller-owned HOLD, or return authority to automatic/native-solar operation. Limits expire after 60 minutes by default (1-240 allowed); no limit means the normal 115 Hz ceiling. Automatic is not start-now. Pressure safety always overrides.",
     parameters: waterParameters,
     success: result,
     failure: WatchmanControlError,

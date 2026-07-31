@@ -293,7 +293,6 @@ const statusForArea = (
         evidence: "estimated",
       },
       drive_hz: compactState(states, "sensor.well_rsi_output_frequency"),
-      user_speed_cap_hz: compactState(states, "input_number.well_user_max_hz"),
       controller: compactState(states, "sensor.well_solar_controller", [
         "requested_mode",
         "reason",
@@ -321,7 +320,15 @@ const statusForArea = (
         "ctrl_command_age_s",
         "ctrl_lease_remaining_s",
         "pressure_cap_hz",
-        "user_cap_hz",
+        "pressure_limit_hz",
+        "operator_limit_active",
+        "operator_limit_hz",
+        "operator_limit_expires_at",
+        "operator_limit_remaining_s",
+        "operator_limit_request_id",
+        "operator_limit_action",
+        "effective_cap_hz",
+        "cap_limiting_reason",
       ]),
       expected_start: compactState(states, "sensor.well_start_forecast", [
         "start_local",
@@ -1105,24 +1112,41 @@ const hvacControl = Effect.fn("WatchmanToolkit.hvacControl")(function* (input: {
 });
 
 const waterControl = Effect.fn("WatchmanToolkit.waterControl")(function* (input: {
-  readonly operation: "set_speed_cap" | "hold" | "automatic";
+  readonly operation: "set_operator_limit" | "clear_operator_limit" | "hold" | "automatic";
   readonly max_hz?: number | undefined;
+  readonly minutes?: number | undefined;
 }) {
   const tool = "watchman_water_control";
   yield* requireCapability(tool);
+  const isLimitMutation =
+    input.operation === "set_operator_limit" || input.operation === "clear_operator_limit";
   const irrelevant = irrelevantParameter(
     tool,
     input,
-    input.operation === "set_speed_cap" ? ["operation", "max_hz"] : ["operation"],
+    input.operation === "set_operator_limit" ? ["operation", "max_hz", "minutes"] : ["operation"],
   );
   if (irrelevant) return yield* irrelevant;
-  if (input.operation === "set_speed_cap") {
+
+  let requestId: string | undefined;
+  if (isLimitMutation) {
+    const crypto = yield* Crypto.Crypto;
+    requestId = (yield* crypto.randomUUIDv4.pipe(
+      Effect.mapError((cause) => fail(tool, "controller", cause.message)),
+    )).toLowerCase();
+  }
+
+  if (input.operation === "set_operator_limit") {
     if (input.max_hz === undefined) {
-      return yield* fail(tool, "controller", "set_speed_cap requires max_hz.");
+      return yield* fail(tool, "controller", "set_operator_limit requires max_hz.");
     }
-    yield* callService(tool, "input_number", "set_value", {
-      entity_id: "input_number.well_user_max_hz",
-      value: input.max_hz,
+    yield* callService(tool, "shell_command", "well_operator_limit_set", {
+      max_hz: input.max_hz,
+      minutes: input.minutes ?? 60,
+      request_id: requestId,
+    });
+  } else if (input.operation === "clear_operator_limit") {
+    yield* callService(tool, "shell_command", "well_operator_limit_clear", {
+      request_id: requestId,
     });
   } else {
     yield* callService(tool, "script", "turn_on", {
@@ -1132,6 +1156,7 @@ const waterControl = Effect.fn("WatchmanToolkit.waterControl")(function* (input:
           : "script.well_solar_return_automatic",
     });
   }
+
   const states = yield* readStates(tool);
   const drive = states.get("sensor.watchman_drive_snapshot");
   const requestedMode =
@@ -1142,21 +1167,45 @@ const waterControl = Effect.fn("WatchmanToolkit.waterControl")(function* (input:
   const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
   const snapshotFresh =
     Number.isFinite(lastUpdatedMs) && nowMs - lastUpdatedMs >= 0 && nowMs - lastUpdatedMs <= 30_000;
-  const requestedSpeedCap = input.operation === "set_speed_cap" ? input.max_hz : undefined;
-  const observedUserCap = drive?.attributes.user_cap_hz;
+  const requestedOperatorLimit =
+    input.operation === "set_operator_limit" ? input.max_hz : undefined;
+  const observedOperatorActive = drive?.attributes.operator_limit_active;
+  const observedOperatorLimit = drive?.attributes.operator_limit_hz;
+  const observedOperatorRequestId = drive?.attributes.operator_limit_request_id;
+  const observedOperatorAction = drive?.attributes.operator_limit_action;
+  const observedPressureLimit = drive?.attributes.pressure_limit_hz;
+  const observedEffectiveCap = drive?.attributes.effective_cap_hz;
   const observedPhysicalCap = drive?.attributes.pressure_cap_hz;
-  const speedCapVerified =
-    requestedSpeedCap !== undefined &&
+  const correlatedLimitReceipt =
+    requestId !== undefined &&
     drive?.state === "True" &&
     drive.attributes.mode === "poller-v3" &&
-    typeof observedUserCap === "number" &&
-    Number.isFinite(observedUserCap) &&
-    observedUserCap === requestedSpeedCap &&
+    observedOperatorRequestId === requestId &&
+    snapshotFresh;
+  const operatorLimitVerified =
+    requestedOperatorLimit !== undefined &&
+    correlatedLimitReceipt &&
+    observedOperatorAction === "set" &&
+    observedOperatorActive === true &&
+    observedOperatorLimit === requestedOperatorLimit &&
+    typeof observedPressureLimit === "number" &&
+    Number.isFinite(observedPressureLimit) &&
+    observedPressureLimit >= 102 &&
+    observedPressureLimit <= 115 &&
+    typeof observedEffectiveCap === "number" &&
+    Number.isFinite(observedEffectiveCap) &&
+    observedEffectiveCap >= 102 &&
+    observedEffectiveCap <= requestedOperatorLimit &&
+    observedEffectiveCap <= observedPressureLimit &&
     typeof observedPhysicalCap === "number" &&
     Number.isFinite(observedPhysicalCap) &&
     observedPhysicalCap >= 102 &&
-    observedPhysicalCap <= requestedSpeedCap &&
-    snapshotFresh;
+    observedPhysicalCap <= observedEffectiveCap;
+  const operatorClearVerified =
+    input.operation === "clear_operator_limit" &&
+    correlatedLimitReceipt &&
+    observedOperatorAction === "clear" &&
+    observedOperatorActive === false;
   const expectedHeld = requestedMode === "hold";
   const controlVerified =
     requestedMode !== undefined &&
@@ -1173,33 +1222,36 @@ const waterControl = Effect.fn("WatchmanToolkit.waterControl")(function* (input:
     commandAge >= 0 &&
     commandAge <= 30 &&
     snapshotFresh;
-  const applied =
-    requestedSpeedCap !== undefined
-      ? speedCapVerified
-        ? "verified"
-        : "pending"
-      : requestedMode !== undefined && controlVerified
-        ? "verified"
-        : "pending";
+  const applied = isLimitMutation
+    ? operatorLimitVerified || operatorClearVerified
+      ? "verified"
+      : "pending"
+    : requestedMode !== undefined && controlVerified
+      ? "verified"
+      : "pending";
   return mutationResult({
-    requested: input,
+    requested: { ...input, ...(requestId === undefined ? {} : { request_id: requestId }) },
     applied,
     observed: statusForArea(states, "water"),
-    evidence:
-      input.operation === "set_speed_cap"
-        ? speedCapVerified
-          ? observedPhysicalCap === requestedSpeedCap
-            ? "A fresh sole-owner poller snapshot confirms the requested user ceiling and matching physical ID102 readback."
-            : "A fresh sole-owner poller snapshot confirms the requested user ceiling and physical ID102 readback below that ceiling."
-          : "Home Assistant accepted the helper value; a fresh sole-owner poller snapshot has not yet confirmed the requested ceiling and physical ID102 at or below it."
-        : applied === "verified"
-          ? "A fresh sole-owner poller snapshot acknowledges the request with matching requested/applied mode, held state, and no control error."
-          : "The controller accepted the request; a fresh complete poller acknowledgment is pending, stale, errored, or safety-held.",
+    evidence: isLimitMutation
+      ? operatorLimitVerified
+        ? "A fresh request-correlated poller snapshot confirms the temporary operator limit; pressure safety and physical ID102 are at or below it."
+        : operatorClearVerified
+          ? "A fresh request-correlated poller snapshot confirms the temporary operator limit is cleared; any remaining lower cap belongs to pressure safety."
+          : "Home Assistant accepted the temporary-limit command; a fresh request-correlated poller snapshot remains pending."
+      : applied === "verified"
+        ? "A fresh sole-owner poller snapshot acknowledges the request with matching requested/applied mode, held state, and no control error."
+        : "The controller accepted the request; a fresh complete poller acknowledgment is pending, stale, errored, or safety-held.",
     safety: {
       automatic_means: "return controller authority; not start-now",
       ctrl_ack: drive?.attributes.ctrl_ack,
       ctrl_error: drive?.attributes.ctrl_error,
-      observed_user_cap_hz: observedUserCap,
+      operator_limit_active: observedOperatorActive,
+      operator_limit_hz: observedOperatorLimit,
+      operator_limit_expires_at: drive?.attributes.operator_limit_expires_at,
+      operator_limit_request_id: observedOperatorRequestId,
+      pressure_limit_hz: observedPressureLimit,
+      effective_cap_hz: observedEffectiveCap,
       actual_id102_cap_hz: observedPhysicalCap,
       safety_latch: attribute(states, "sensor.well_solar_controller", "safety_latch"),
     },
