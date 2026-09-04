@@ -49,6 +49,9 @@ type TraitsRenderInput = {
   prompt: string;
   onPromptChange: (prompt: string) => void;
   onWatchmanUnlockRequired?: (applySelection: () => void) => void;
+  visibleDescriptorIds?: ReadonlyArray<string>;
+  visibleOptionIdsByDescriptor?: Readonly<Record<string, ReadonlyArray<string>>>;
+  triggerLabelOverride?: string;
 };
 
 export function getComposerPromptInjectionState(prompt: string): ComposerPromptInjectionState {
@@ -114,11 +117,22 @@ function renderTraitsControl(
     prompt,
     onPromptChange,
     onWatchmanUnlockRequired,
+    visibleDescriptorIds,
+    visibleOptionIdsByDescriptor,
+    triggerLabelOverride,
   } = input;
   const hasTarget = threadRef !== undefined || draftId !== undefined;
   if (
     !hasTarget ||
-    !shouldRenderTraitsControls({ provider, models, model, modelOptions, prompt })
+    !shouldRenderTraitsControls({
+      provider,
+      models,
+      model,
+      modelOptions,
+      prompt,
+      ...(visibleDescriptorIds ? { visibleDescriptorIds } : {}),
+      ...(visibleOptionIdsByDescriptor ? { visibleOptionIdsByDescriptor } : {}),
+    })
   ) {
     return null;
   }
@@ -134,6 +148,9 @@ function renderTraitsControl(
       prompt={prompt}
       onPromptChange={onPromptChange}
       {...(onWatchmanUnlockRequired ? { onWatchmanUnlockRequired } : {})}
+      {...(visibleDescriptorIds ? { visibleDescriptorIds } : {})}
+      {...(visibleOptionIdsByDescriptor ? { visibleOptionIdsByDescriptor } : {})}
+      {...(triggerLabelOverride ? { triggerLabelOverride } : {})}
     />
   );
 }

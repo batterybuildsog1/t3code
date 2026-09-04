@@ -13,7 +13,7 @@ const dependencies = [
   Crypto.Crypto,
 ];
 const screen = Schema.Literals(["a", "b", "c", "d", "all"]);
-const fahrenheit = Schema.Int.check(Schema.isBetween({ minimum: 66, maximum: 80 }));
+const headFahrenheit = Schema.Int.check(Schema.isBetween({ minimum: 65, maximum: 85 }));
 const noParameters = Schema.Record(Schema.String, Schema.Never);
 const strictParameters = { parseOptions: { onExcessProperty: "error" } } as const;
 
@@ -49,26 +49,47 @@ const tvParameters = Schema.Struct({
 }).annotate(strictParameters);
 
 const hvacParameters = Schema.Struct({
-  operation: Schema.Literals(["target", "pairs", "mode", "party", "hall"]),
-  target_f: Schema.optional(fahrenheit),
+  operation: Schema.Literals(["target", "pairs", "heads", "mode", "party", "hall"]),
+  target_f: Schema.optional(headFahrenheit),
   heads: Schema.optional(
     Schema.Array(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 8 }))).check(
       Schema.isMinLength(1),
     ),
   ),
-  action: Schema.optional(Schema.Literals(["on", "off", "only", "start", "end"])),
-  fan_mode: Schema.optional(Schema.Literals(["medium", "high"])),
-  mode: Schema.optional(Schema.Literals(["Auto", "Manual", "Off"])),
-  minutes: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 30, maximum: 360 }))),
-  hall_mode: Schema.optional(Schema.Literals(["cool", "heat", "off"])),
-  hall_setpoint_f: Schema.optional(
-    Schema.Int.check(Schema.isBetween({ minimum: 75, maximum: 85 })),
+  pairs: Schema.optional(
+    Schema.Array(Schema.Literals(["A", "B", "C", "D"])).check(
+      Schema.isMinLength(1),
+      Schema.isMaxLength(4),
+    ),
   ),
+  action: Schema.optional(Schema.Literals(["start", "end"])),
+  power: Schema.optional(Schema.Literals(["on", "off"])),
+  selection: Schema.optional(Schema.Literals(["preserve", "only"])),
+  head_mode: Schema.optional(Schema.Literals(["auto", "cool", "dry", "fan_only", "heat"])),
+  fan_mode: Schema.optional(Schema.Literals(["auto", "low", "medium", "high"])),
+  swing_mode: Schema.optional(Schema.Literals(["off", "vertical"])),
+  mode: Schema.optional(Schema.Literals(["Auto", "Manual", "Off"])),
+  minutes: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 5, maximum: 360 }))),
+  hall_mode: Schema.optional(
+    Schema.Literals(["cool", "heat", "fan_only", "dry", "heat_cool", "off"]),
+  ),
+  hall_setpoint_f: Schema.optional(
+    Schema.Int.check(Schema.isBetween({ minimum: 46, maximum: 86 })),
+  ),
+  hall_fan_mode: Schema.optional(
+    Schema.Literals(["quiet", "low", "medium", "high", "auto", "strong"]),
+  ),
+  hall_swing_mode: Schema.optional(Schema.Literals(["stopped", "rangefull"])),
 }).annotate(strictParameters);
 
 const waterParameters = Schema.Struct({
   operation: Schema.Literals(["set_speed_cap", "hold", "automatic"]),
   max_hz: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 102, maximum: 115 }))),
+}).annotate(strictParameters);
+
+const operationStatusParameters = Schema.Struct({
+  operation_id: Schema.String.check(Schema.isMinLength(4), Schema.isMaxLength(160)),
+  wait_seconds: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 10, maximum: 60 }))),
 }).annotate(strictParameters);
 
 export class WatchmanControlError extends Schema.TaggedErrorClass<WatchmanControlError>()(
@@ -128,6 +149,17 @@ export const WatchmanHistoryTool = readTool(
   }).annotate(Tool.Title, "Read Watchman history"),
 );
 
+export const WatchmanOperationStatusTool = readTool(
+  Tool.make("watchman_operation_status", {
+    description:
+      "Read or briefly wait for one correlated Watchman mutation receipt, including isolated HVAC hall and exact-head operations. Pass the provider-neutral operation_id returned by a control tool. Omit wait_seconds for an immediate read, or use 10-60 seconds for one bounded wait. A platform acknowledgement is not verification; preserve the controller's applied state and evidence exactly.",
+    parameters: operationStatusParameters,
+    success: result,
+    failure: WatchmanControlError,
+    dependencies,
+  }).annotate(Tool.Title, "Check Watchman operation"),
+);
+
 export const WatchmanTvControlTool = mutationTool(
   Tool.make("watchman_tv_control", {
     description:
@@ -142,7 +174,7 @@ export const WatchmanTvControlTool = mutationTool(
 export const WatchmanHvacControlTool = mutationTool(
   Tool.make("watchman_hvac_control", {
     description:
-      "Request HVAC changes through the installed v2 helper/reconciler boundary. The deterministic controller owns pair expansion, pacing, leases, equipment protection, and applied-state verification.",
+      "Control HVAC only through its installed deterministic boundary. operation=heads controls exactly named Samsung Heads 1-8 and never broadens a head to its electrical partner; it fails closed until the durable exact-head v3 service is active. operation=hall controls the separate inverter hall through its own durable v3 receipt and never uses the Samsung request lane; it accepts the hall's live mode, 46-86F setpoint, fan, and swing values, while off rejects active settings. Omitted hall settings resolve from captured live state, never guessed defaults. Pre-cutover hall retains the legacy open-loop Sensibo mode/setpoint path and must remain pending; its historical setpoint range remains 75-85F, and fan/swing require v3. Developer maintenance may use operation=pairs with explicit pair labels A-D only; A=1+2, B=3+4, C=5+6, D=7+8. Samsung targets support the declared 65-85F range; pair maintenance supports medium/high fan and a 5-360 minute lease. Whole-building Party/Off/Auto remain available. Every installed v3 mutation returns a durable operation_id and direct-state verified, pending, or safety outcome. Never turn a platform acknowledgement into success.",
     parameters: hvacParameters,
     success: result,
     failure: WatchmanControlError,
@@ -175,6 +207,7 @@ export const WatchmanAutomationTool = readTool(
 export const WatchmanToolkit = Toolkit.make(
   WatchmanStatusTool,
   WatchmanHistoryTool,
+  WatchmanOperationStatusTool,
   WatchmanTvControlTool,
   WatchmanHvacControlTool,
   WatchmanWaterControlTool,

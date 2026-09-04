@@ -96,11 +96,25 @@ function getSelectedTraits(
   prompt: string,
   modelOptions: ProviderOptions | null | undefined,
   allowPromptInjectedEffort: boolean,
+  visibleDescriptorIds?: ReadonlyArray<string>,
+  visibleOptionIdsByDescriptor?: Readonly<Record<string, ReadonlyArray<string>>>,
 ) {
   const caps = getProviderModelCapabilities(models, model, provider);
-  const descriptors = getProviderOptionDescriptors({
+  const allDescriptors = getProviderOptionDescriptors({
     caps,
     selections: modelOptions,
+  });
+  const visibleDescriptors = visibleDescriptorIds
+    ? allDescriptors.filter((descriptor) => visibleDescriptorIds.includes(descriptor.id))
+    : allDescriptors;
+  const descriptors = visibleDescriptors.map((descriptor) => {
+    const visibleOptionIds = visibleOptionIdsByDescriptor?.[descriptor.id];
+    return descriptor.type === "select" && visibleOptionIds
+      ? {
+          ...descriptor,
+          options: descriptor.options.filter((option) => visibleOptionIds.includes(option.id)),
+        }
+      : descriptor;
   });
   const selectDescriptors = descriptors.filter(
     (descriptor): descriptor is Extract<ProviderOptionDescriptor, { type: "select" }> =>
@@ -170,6 +184,8 @@ function getTraitsSectionVisibility(input: {
   prompt: string;
   modelOptions: ProviderOptions | null | undefined;
   allowPromptInjectedEffort?: boolean;
+  visibleDescriptorIds?: ReadonlyArray<string>;
+  visibleOptionIdsByDescriptor?: Readonly<Record<string, ReadonlyArray<string>>>;
 }) {
   const selected = getSelectedTraits(
     input.provider,
@@ -178,6 +194,8 @@ function getTraitsSectionVisibility(input: {
     input.prompt,
     input.modelOptions,
     input.allowPromptInjectedEffort ?? true,
+    input.visibleDescriptorIds,
+    input.visibleOptionIdsByDescriptor,
   );
 
   const showEffort = selected.primarySelectDescriptor !== null;
@@ -204,6 +222,8 @@ export function shouldRenderTraitsControls(input: {
   prompt: string;
   modelOptions: ProviderOptions | null | undefined;
   allowPromptInjectedEffort?: boolean;
+  visibleDescriptorIds?: ReadonlyArray<string>;
+  visibleOptionIdsByDescriptor?: Readonly<Record<string, ReadonlyArray<string>>>;
 }): boolean {
   return getTraitsSectionVisibility(input).hasAnyControls;
 }
@@ -217,6 +237,9 @@ export interface TraitsMenuContentProps {
   onPromptChange: (prompt: string) => void;
   modelOptions?: ProviderOptions | null | undefined;
   allowPromptInjectedEffort?: boolean;
+  visibleDescriptorIds?: ReadonlyArray<string>;
+  visibleOptionIdsByDescriptor?: Readonly<Record<string, ReadonlyArray<string>>>;
+  triggerLabelOverride?: string;
   triggerVariant?: VariantProps<typeof buttonVariants>["variant"];
   triggerClassName?: string;
   onWatchmanUnlockRequired?: (applySelection: () => void) => void;
@@ -231,6 +254,8 @@ export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
   onPromptChange,
   modelOptions,
   allowPromptInjectedEffort = true,
+  visibleDescriptorIds,
+  visibleOptionIdsByDescriptor,
   onWatchmanUnlockRequired,
   ...persistence
 }: TraitsMenuContentProps & TraitsPersistence) {
@@ -268,6 +293,8 @@ export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
     prompt,
     modelOptions,
     allowPromptInjectedEffort,
+    ...(visibleDescriptorIds ? { visibleDescriptorIds } : {}),
+    ...(visibleOptionIdsByDescriptor ? { visibleOptionIdsByDescriptor } : {}),
   });
   const updateDescriptors = (nextDescriptors: ReadonlyArray<ProviderOptionDescriptor>) => {
     updateModelOptions(buildProviderOptionSelectionsFromDescriptors(nextDescriptors));
@@ -438,6 +465,9 @@ export const TraitsPicker = memo(function TraitsPicker({
   onPromptChange,
   modelOptions,
   allowPromptInjectedEffort = true,
+  visibleDescriptorIds,
+  visibleOptionIdsByDescriptor,
+  triggerLabelOverride,
   triggerVariant,
   triggerClassName,
   onWatchmanUnlockRequired,
@@ -452,6 +482,8 @@ export const TraitsPicker = memo(function TraitsPicker({
       prompt,
       modelOptions,
       allowPromptInjectedEffort,
+      ...(visibleDescriptorIds ? { visibleDescriptorIds } : {}),
+      ...(visibleOptionIdsByDescriptor ? { visibleOptionIdsByDescriptor } : {}),
     });
   if (
     !shouldRenderTraitsControls({
@@ -461,6 +493,8 @@ export const TraitsPicker = memo(function TraitsPicker({
       prompt,
       modelOptions,
       allowPromptInjectedEffort,
+      ...(visibleDescriptorIds ? { visibleDescriptorIds } : {}),
+      ...(visibleOptionIdsByDescriptor ? { visibleOptionIdsByDescriptor } : {}),
     })
   ) {
     return null;
@@ -505,13 +539,13 @@ export const TraitsPicker = memo(function TraitsPicker({
         {isCodexStyle ? (
           <span className="flex min-w-0 w-full items-center gap-1.5 overflow-hidden">
             {fastModeIcon}
-            <span className="min-w-0 truncate">{triggerLabel}</span>
+            <span className="min-w-0 truncate">{triggerLabelOverride ?? triggerLabel}</span>
             <ChevronDownIcon aria-hidden="true" className="size-3 shrink-0 opacity-60" />
           </span>
         ) : (
           <>
             {fastModeIcon}
-            <span>{triggerLabel}</span>
+            <span>{triggerLabelOverride ?? triggerLabel}</span>
             <ChevronDownIcon aria-hidden="true" className="size-3 opacity-60" />
           </>
         )}
@@ -526,6 +560,8 @@ export const TraitsPicker = memo(function TraitsPicker({
           onPromptChange={onPromptChange}
           modelOptions={modelOptions}
           allowPromptInjectedEffort={allowPromptInjectedEffort}
+          {...(visibleDescriptorIds ? { visibleDescriptorIds } : {})}
+          {...(visibleOptionIdsByDescriptor ? { visibleOptionIdsByDescriptor } : {})}
           onWatchmanUnlockRequired={(applySelection) => {
             setIsMenuOpen(false);
             onWatchmanUnlockRequired?.(applySelection);

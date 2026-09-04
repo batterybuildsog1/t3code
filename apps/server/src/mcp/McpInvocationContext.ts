@@ -7,7 +7,7 @@ import {
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 
-export type McpCapability = "preview" | "watchman-control";
+export type McpCapability = "preview" | "watchman-control" | "watchman-developer-control";
 
 export interface McpInvocationScope {
   readonly environmentId: EnvironmentId;

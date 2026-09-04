@@ -17,6 +17,8 @@ import { primaryServerKeybindingsAtom } from "../state/server";
 import { useClientSettings } from "../hooks/useSettings";
 import ThreadSidebar from "./Sidebar";
 import ThreadSidebarV2 from "./SidebarV2";
+import { WatchmanControlSidebar } from "./WatchmanControlSidebar";
+import { useActiveWatchmanSurface } from "../hooks/useActiveWatchmanSurface";
 import { useSidebarStageBackdropVariant } from "./SidebarStageBackdrop";
 import {
   resolveInitialThreadSidebarWidth,
@@ -120,8 +122,10 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
   // and is identical for both sidebars — so v1 stays mounted there.
   const pathname = useLocation({ select: (location) => location.pathname });
   const isOnSettings = pathname === "/settings" || pathname.startsWith("/settings/");
+  const watchmanSurface = useActiveWatchmanSurface();
+  const useWatchmanControlSidebar = watchmanSurface === "control" && !isOnSettings;
   const useSidebarV2 = sidebarV2Enabled && !isOnSettings;
-  const useSidebarV2Theme = useSidebarV2 || isOnSettings;
+  const useSidebarV2Theme = (useSidebarV2 || isOnSettings) && !useWatchmanControlSidebar;
   const isMacosDesktop = isElectron && isMacPlatform(navigator.platform);
   const [sidebarWidth, setSidebarWidth] = useState(readInitialThreadSidebarWidth);
   // Subscribed rather than read once: the clamp must track live window size,
@@ -197,7 +201,13 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
           onResize: setSidebarWidth,
         }}
       >
-        {useSidebarV2 ? <ThreadSidebarV2 /> : <ThreadSidebar />}
+        {useWatchmanControlSidebar ? (
+          <WatchmanControlSidebar />
+        ) : useSidebarV2 ? (
+          <ThreadSidebarV2 />
+        ) : (
+          <ThreadSidebar />
+        )}
         <SidebarRail />
       </Sidebar>
       {children}

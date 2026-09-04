@@ -178,6 +178,7 @@ import {
   type LucideIcon,
   LockIcon,
   LockOpenIcon,
+  MicIcon,
   PenLineIcon,
   SparklesIcon,
   XIcon,
@@ -206,6 +207,11 @@ import { formatProviderSkillDisplayName } from "../../providerSkillPresentation"
 import { searchProviderSkills } from "../../providerSkillSearch";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import type { ReviewCommentContext } from "../../reviewCommentContext";
+import {
+  WATCHMAN_CONTROL_AGENT,
+  WATCHMAN_DEVELOPER_AGENT,
+  type WatchmanSurface,
+} from "../../watchmanDeveloperMode";
 
 const IMAGE_SIZE_LIMIT_LABEL = `${Math.round(PROVIDER_SEND_TURN_MAX_IMAGE_BYTES / (1024 * 1024))}MB`;
 
@@ -571,6 +577,7 @@ export interface ChatComposerProps {
   // Mode
   runtimeMode: RuntimeMode;
   interactionMode: ProviderInteractionMode;
+  watchmanSurface: WatchmanSurface;
 
   // Provider / model
   lockedProvider: ProviderDriverKind | null;
@@ -668,6 +675,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     planSidebarOpen,
     runtimeMode,
     interactionMode,
+    watchmanSurface,
     lockedProvider,
     providerStatuses,
     activeProjectDefaultModelSelection,
@@ -1256,6 +1264,27 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     onPromptChange: setPromptFromTraits,
     onWatchmanUnlockRequired: requestWatchmanDeveloperSelectionUnlock,
   });
+  const watchmanModePicker = renderProviderTraitsPicker({
+    provider: selectedProvider,
+    instanceId: selectedInstanceId,
+    ...(routeKind === "server" ? { threadRef: routeThreadRef } : {}),
+    ...(routeKind === "draft" && draftId ? { draftId } : {}),
+    model: selectedModel,
+    models: selectedProviderModels,
+    modelOptions: composerModelOptions?.[selectedInstanceId],
+    prompt,
+    onPromptChange: setPromptFromTraits,
+    onWatchmanUnlockRequired: requestWatchmanDeveloperSelectionUnlock,
+    visibleDescriptorIds: ["agent"],
+    visibleOptionIdsByDescriptor: {
+      agent: [WATCHMAN_CONTROL_AGENT, WATCHMAN_DEVELOPER_AGENT],
+    },
+    ...(watchmanSurface
+      ? { triggerLabelOverride: watchmanSurface === "control" ? "Control" : "Developer" }
+      : {}),
+  });
+  const isWatchmanControl = watchmanSurface === "control";
+  const showWatchmanVoiceControl = watchmanSurface !== null;
   const pendingPrimaryAction = useMemo(
     () =>
       activePendingProgress
@@ -2816,8 +2845,25 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   ? activePendingProgress.customAnswer ||
                     "Type your own answer, or leave this blank to use the selected option"
                   : prompt.trim() ||
-                    (noProviderAvailable ? "Enable a provider in Settings" : "Ask anything...")}
+                    (noProviderAvailable
+                      ? "Enable a provider in Settings"
+                      : isWatchmanControl
+                        ? "Ask Watchman to control the building"
+                        : "Ask anything...")}
               </button>
+              {showWatchmanVoiceControl ? (
+                <button
+                  type="button"
+                  className="flex size-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                  aria-label="Voice control"
+                  title="Voice control"
+                  data-watchman-voice-control="ready"
+                  onPointerDown={(event) => event.preventDefault()}
+                  onClick={() => {}}
+                >
+                  <MicIcon className="size-4" />
+                </button>
+              ) : null}
               <button
                 type="button"
                 className="flex size-8 shrink-0 items-center justify-center rounded-full bg-primary/90 text-primary-foreground disabled:opacity-30"
@@ -3041,13 +3087,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       ? "Type your own answer, or leave this blank to use the selected option"
                       : showPlanFollowUpPrompt && activeProposedPlan
                         ? "Add feedback to refine the plan, or leave this blank to implement it"
-                        : projectSelectionRequired
-                          ? "Choose a project above to start a thread"
-                          : noProviderAvailable
-                            ? "Enable a provider in Settings to send a message"
-                            : phase === "disconnected"
-                              ? "Ask for follow-up changes or attach images"
-                              : "Ask anything, @tag files/folders, $use skills, or / for commands"
+                        : isWatchmanControl
+                          ? "Ask Watchman to control the building"
+                          : projectSelectionRequired
+                            ? "Choose a project above to start a thread"
+                            : noProviderAvailable
+                              ? "Enable a provider in Settings to send a message"
+                              : phase === "disconnected"
+                                ? "Ask for follow-up changes or attach images"
+                                : "Ask anything, @tag files/folders, $use skills, or / for commands"
                 }
                 disabled={isConnecting || isComposerApprovalState || projectSelectionRequired}
               />
@@ -3102,7 +3150,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
               )}
             >
               <div className="-m-1 flex min-w-0 flex-1 items-center gap-1 overflow-x-auto p-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-                {noProviderAvailable ? (
+                {isWatchmanControl ? (
+                  <div className="flex shrink-0 items-center gap-1">
+                    {watchmanModePicker}
+                    <span className="rounded-full bg-muted px-2.5 py-1 text-xs text-muted-foreground">
+                      Grok 4.5
+                    </span>
+                  </div>
+                ) : noProviderAvailable ? (
                   <Button
                     type="button"
                     size="sm"
@@ -3140,7 +3195,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   />
                 )}
 
-                {isComposerFooterCompact ? (
+                {isWatchmanControl ? null : isComposerFooterCompact ? (
                   <CompactComposerControlsMenu
                     activePlan={showPlanSidebarToggle}
                     interactionMode={interactionMode}
@@ -3189,9 +3244,22 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 }
                 className="flex shrink-0 flex-nowrap items-center justify-end gap-2"
               >
+                {showWatchmanVoiceControl ? (
+                  <Button
+                    type="button"
+                    size="icon-sm"
+                    variant="ghost"
+                    aria-label="Voice control"
+                    title="Voice control"
+                    data-watchman-voice-control="ready"
+                    onClick={() => {}}
+                  >
+                    <MicIcon className="size-4" />
+                  </Button>
+                ) : null}
                 <ComposerFooterPrimaryActions
                   compact={isComposerPrimaryActionsCompact}
-                  activeContextWindow={activeContextWindow}
+                  activeContextWindow={isWatchmanControl ? null : activeContextWindow}
                   activeThreadProviderDisplayName={activeThreadProviderDisplayName}
                   pendingAction={pendingPrimaryAction}
                   isRunning={phase === "running"}

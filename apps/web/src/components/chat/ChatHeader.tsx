@@ -19,6 +19,9 @@ import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useT3ProjectFileScripts } from "~/hooks/useT3ProjectFileScripts";
 import { ProjectFavicon } from "../ProjectFavicon";
 import { cn } from "~/lib/utils";
+import { Button } from "../ui/button";
+import { SquarePenIcon } from "lucide-react";
+import type { WatchmanSurface } from "../../watchmanDeveloperMode";
 
 interface ChatHeaderProps {
   activeThreadEnvironmentId: EnvironmentId;
@@ -34,6 +37,7 @@ interface ChatHeaderProps {
   availableEditors: ReadonlyArray<EditorId>;
   rightPanelOpen: boolean;
   gitCwd: string | null;
+  watchmanSurface: WatchmanSurface;
   onNewThreadInProject: () => void;
   onRunProjectScript: (script: ProjectScript) => void;
   onAddProjectScript: (input: NewProjectScriptInput) => Promise<ProjectScriptActionResult>;
@@ -70,6 +74,7 @@ export const ChatHeader = memo(function ChatHeader({
   availableEditors,
   rightPanelOpen,
   gitCwd,
+  watchmanSurface,
   onNewThreadInProject,
   onRunProjectScript,
   onAddProjectScript,
@@ -86,6 +91,35 @@ export const ChatHeader = memo(function ChatHeader({
     activeThreadEnvironmentId,
     primaryEnvironmentId,
   });
+  if (watchmanSurface === "control") {
+    return (
+      <div
+        className="flex min-w-0 flex-1 items-center justify-between gap-3"
+        data-watchman-surface="control"
+      >
+        <div className="min-w-0">
+          <div className="truncate text-sm font-semibold">Watchman Control</div>
+          <div className="truncate text-xs text-muted-foreground">{activeThreadTitle}</div>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <span className="hidden rounded-full bg-muted px-2.5 py-1 text-xs text-muted-foreground min-[420px]:inline-flex">
+            Grok 4.5
+          </span>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="gap-1.5"
+            data-watchman-new-chat="control-header"
+            onClick={onNewThreadInProject}
+          >
+            <SquarePenIcon className="size-3.5" />
+            New chat
+          </Button>
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="@container/header-actions flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
       <div className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden sm:gap-3">
@@ -140,6 +174,19 @@ export const ChatHeader = memo(function ChatHeader({
           rightPanelOpen ? "pr-0" : "pr-16",
         )}
       >
+        {watchmanSurface === "developer" ? (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="shrink-0 gap-1.5"
+            data-watchman-new-chat="developer-header"
+            onClick={onNewThreadInProject}
+          >
+            <SquarePenIcon className="size-3.5" />
+            New chat
+          </Button>
+        ) : null}
         {activeProjectScripts && (
           <ProjectScriptsControl
             scripts={activeProjectScripts}

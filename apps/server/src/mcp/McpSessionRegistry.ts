@@ -15,10 +15,16 @@ export interface McpCredentialRequest {
   readonly threadId: ThreadId;
   readonly providerInstanceId: ProviderInstanceId;
   readonly includeWatchmanControl?: boolean;
+  readonly includeWatchmanDeveloperControl?: boolean;
 }
 
 export interface McpIssuedCredential {
   readonly config: McpProviderSession.McpProviderSessionConfig;
+}
+
+export interface WatchmanMcpCapabilities {
+  readonly watchmanControl: boolean;
+  readonly watchmanDeveloperControl: boolean;
 }
 
 export interface McpSessionRegistryShape {
@@ -26,7 +32,10 @@ export interface McpSessionRegistryShape {
   readonly resolve: (
     rawToken: string,
   ) => Effect.Effect<McpInvocationContext.McpInvocationScope | undefined>;
-  readonly setWatchmanControl: (threadId: ThreadId, enabled: boolean) => Effect.Effect<void>;
+  readonly setWatchmanCapabilities: (
+    threadId: ThreadId,
+    capabilities: WatchmanMcpCapabilities,
+  ) => Effect.Effect<void>;
   /**
    * Records a sign of life for every credential bound to `threadId`. Provider
    * turns call this so that a session which is plainly alive keeps its
@@ -133,6 +142,9 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
         capabilities: new Set([
           "preview",
           ...(request.includeWatchmanControl ? (["watchman-control"] as const) : []),
+          ...(request.includeWatchmanControl && request.includeWatchmanDeveloperControl
+            ? (["watchman-developer-control"] as const)
+            : []),
         ]),
         issuedAt,
       };
@@ -186,18 +198,23 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
     },
   );
 
-  const setWatchmanControl: McpSessionRegistryShape["setWatchmanControl"] = Effect.fn(
-    "McpSessionRegistry.setWatchmanControl",
-  )(function* (threadId, enabled) {
+  const setWatchmanCapabilities: McpSessionRegistryShape["setWatchmanCapabilities"] = Effect.fn(
+    "McpSessionRegistry.setWatchmanCapabilities",
+  )(function* (threadId, requested) {
     yield* SynchronizedRef.update(state, ({ records }) => {
       const next = new Map(records);
       for (const [tokenHash, record] of records) {
         if (record.scope.threadId !== threadId) continue;
         const capabilities = new Set(record.scope.capabilities);
-        if (enabled) {
+        if (requested.watchmanControl) {
           capabilities.add("watchman-control");
         } else {
           capabilities.delete("watchman-control");
+        }
+        if (requested.watchmanControl && requested.watchmanDeveloperControl) {
+          capabilities.add("watchman-developer-control");
+        } else {
+          capabilities.delete("watchman-developer-control");
         }
         next.set(tokenHash, {
           ...record,
@@ -216,7 +233,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
   return McpSessionRegistry.of({
     issue,
     resolve,
-    setWatchmanControl,
+    setWatchmanCapabilities,
     touch,
     revokeProviderSession: Effect.fn("McpSessionRegistry.revokeProviderSession")(
       function* (providerSessionId) {
@@ -266,12 +283,12 @@ export const issueActiveMcpCredential = (
 export const touchActiveMcpThread = (threadId: ThreadId): Effect.Effect<void> =>
   activeMcpSessionRegistry ? activeMcpSessionRegistry.touch(threadId) : Effect.void;
 
-export const setActiveMcpWatchmanControl = (
+export const setActiveMcpWatchmanCapabilities = (
   threadId: ThreadId,
-  enabled: boolean,
+  capabilities: WatchmanMcpCapabilities,
 ): Effect.Effect<void> =>
   activeMcpSessionRegistry
-    ? activeMcpSessionRegistry.setWatchmanControl(threadId, enabled)
+    ? activeMcpSessionRegistry.setWatchmanCapabilities(threadId, capabilities)
     : Effect.void;
 
 export const revokeActiveMcpThread = (threadId: ThreadId): Effect.Effect<void> =>

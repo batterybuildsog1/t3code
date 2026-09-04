@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vite-plus/test";
-import type { ProviderOptionDescriptor } from "@t3tools/contracts";
-import { buildTraitsTriggerDisplay } from "./TraitsPicker";
+import {
+  ProviderDriverKind,
+  type ProviderOptionDescriptor,
+  type ServerProviderModel,
+} from "@t3tools/contracts";
+import { buildTraitsTriggerDisplay, shouldRenderTraitsControls } from "./TraitsPicker";
 
 function selectDescriptor(
   id: string,
@@ -106,5 +110,53 @@ describe("buildTraitsTriggerDisplay", () => {
         fastModeEnabled: true,
       }),
     ).toEqual({ label: "Ultrathink", showFastModeIcon: true });
+  });
+});
+
+describe("filtered traits controls", () => {
+  const provider = ProviderDriverKind.make("opencode");
+  const model = "xai/grok-4.5";
+  const models: ReadonlyArray<ServerProviderModel> = [
+    {
+      slug: model,
+      name: "Grok 4.5",
+      isCustom: false,
+      capabilities: {
+        optionDescriptors: [
+          selectDescriptor("variant", [{ id: "fast", label: "Fast" }], "fast"),
+          selectDescriptor(
+            "agent",
+            [
+              { id: "watchman-control", label: "Control" },
+              { id: "watchman-developer", label: "Developer" },
+            ],
+            "watchman-control",
+          ),
+        ],
+      },
+    },
+  ];
+
+  it("can expose only the Watchman mode while hiding model traits", () => {
+    expect(
+      shouldRenderTraitsControls({
+        provider,
+        model,
+        models,
+        modelOptions: [{ id: "agent", value: "watchman-control" }],
+        prompt: "",
+        visibleDescriptorIds: ["agent"],
+      }),
+    ).toBe(true);
+    expect(
+      shouldRenderTraitsControls({
+        provider,
+        model,
+        models,
+        modelOptions: [{ id: "variant", value: "fast" }],
+        prompt: "",
+        visibleDescriptorIds: ["missing"],
+      }),
+    ).toBe(false);
   });
 });

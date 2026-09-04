@@ -308,6 +308,7 @@ import { useAssetUrls } from "../assets/assetUrls";
 import {
   isWatchmanDeveloperSelectionUnlocked,
   selectedWatchmanAgent,
+  watchmanSurfaceForModelSelection,
   WATCHMAN_CONTROL_AGENT,
   WATCHMAN_CONTROL_PROVIDER_INSTANCE_ID,
 } from "../watchmanDeveloperMode";
@@ -1224,6 +1225,11 @@ function ChatViewContent(props: ChatViewProps) {
   const composerActiveProvider = useComposerDraftStore(
     (store) => store.getComposerDraft(composerDraftTarget)?.activeProvider ?? null,
   );
+  const composerModelSelection = useComposerDraftStore((store) => {
+    const draft = store.getComposerDraft(composerDraftTarget);
+    const activeProvider = draft?.activeProvider;
+    return activeProvider ? (draft.modelSelectionByProvider[activeProvider] ?? null) : null;
+  });
   const setComposerDraftPrompt = useComposerDraftStore((store) => store.setPrompt);
   const addComposerDraftImages = useComposerDraftStore((store) => store.addImages);
   const setComposerDraftTerminalContexts = useComposerDraftStore(
@@ -1438,6 +1444,10 @@ function ChatViewContent(props: ChatViewProps) {
   // depend on which route is mounted.
   const isServerThread = serverThread !== null;
   const activeThread = isServerThread ? serverThread : localDraftThread;
+  const watchmanSurface = watchmanSurfaceForModelSelection(
+    composerModelSelection ?? activeThread?.modelSelection,
+  );
+  const isWatchmanControl = watchmanSurface === "control";
   const threadError = isServerThread
     ? (localServerError ?? serverThread?.session?.lastError ?? null)
     : localDraftError;
@@ -1521,10 +1531,11 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const previewPanelOpen = activeRightPanelKind === "preview" && isPreviewSupportedInRuntime();
   const rightPanelOpen = rightPanelState.isOpen;
-  const canMaximizeRightPanel = rightPanelOpen && !shouldUsePlanSidebarSheet;
+  const visibleRightPanelOpen = rightPanelOpen && !isWatchmanControl;
+  const canMaximizeRightPanel = visibleRightPanelOpen && !shouldUsePlanSidebarSheet;
   const rightPanelMaximized =
     canMaximizeRightPanel && maximizedRightPanelThreadKey === routeThreadKey;
-  const inlineRightPanelOwnsTitleBar = rightPanelOpen && !shouldUsePlanSidebarSheet;
+  const inlineRightPanelOwnsTitleBar = visibleRightPanelOpen && !shouldUsePlanSidebarSheet;
 
   useEffect(() => {
     if (!activeThreadRef) return;
@@ -5672,7 +5683,7 @@ function ChatViewContent(props: ChatViewProps) {
       terminalOpen={terminalUiState.terminalOpen}
       terminalShortcutLabel={shortcutLabelForCommand(keybindings, "terminal.toggle")}
       rightPanelAvailable={activeProject !== null}
-      rightPanelOpen={rightPanelOpen}
+      rightPanelOpen={visibleRightPanelOpen}
       rightPanelShortcutLabel={shortcutLabelForCommand(keybindings, "rightPanel.toggle")}
       onToggleTerminal={toggleTerminalVisibility}
       onToggleRightPanel={toggleRightPanel}
@@ -5680,7 +5691,7 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const panelLayoutControls = (
     <div className="workspace-titlebar-controls z-50 gap-1 [-webkit-app-region:no-drag]">
-      {rightPanelOpen && !shouldUsePlanSidebarSheet ? (
+      {visibleRightPanelOpen && !shouldUsePlanSidebarSheet ? (
         <RightPanelMaximizeControl
           maximized={rightPanelMaximized}
           onToggle={toggleRightPanelMaximized}
@@ -5766,7 +5777,7 @@ function ChatViewContent(props: ChatViewProps) {
 
   return (
     <div className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden bg-background">
-      {rightPanelOpen && !shouldUsePlanSidebarSheet ? panelLayoutControls : null}
+      {visibleRightPanelOpen && !shouldUsePlanSidebarSheet ? panelLayoutControls : null}
       <div
         className={cn(
           "flex min-h-0 min-w-0 flex-col overflow-x-hidden",
@@ -5790,7 +5801,7 @@ function ChatViewContent(props: ChatViewProps) {
             COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS,
           )}
         >
-          {!rightPanelOpen ? panelLayoutControls : null}
+          {!visibleRightPanelOpen && !isWatchmanControl ? panelLayoutControls : null}
           <ChatHeader
             activeThreadEnvironmentId={activeThread.environmentId}
             activeThreadId={activeThread.id}
@@ -5805,7 +5816,8 @@ function ChatViewContent(props: ChatViewProps) {
             }
             keybindings={keybindings}
             availableEditors={availableEditors}
-            rightPanelOpen={rightPanelOpen}
+            rightPanelOpen={visibleRightPanelOpen}
+            watchmanSurface={watchmanSurface}
             gitCwd={gitCwd}
             onNewThreadInProject={handleNewThreadInActiveProject}
             onRunProjectScript={runProjectScript}
@@ -5919,6 +5931,7 @@ function ChatViewContent(props: ChatViewProps) {
                         <DraftHeroHeadline
                           activeProjectRef={activeProjectRef}
                           activeProjectTitle={activeProject?.title ?? null}
+                          watchmanSurface={watchmanSurface}
                         />
                       </div>
                       <ComposerBannerStack className="relative z-0" items={composerBannerItems} />
@@ -5937,7 +5950,9 @@ function ChatViewContent(props: ChatViewProps) {
                     <div
                       className={cn(
                         "chat-composer-glass-shell relative mx-auto w-full max-w-3xl",
-                        showComposerContextStrip && "chat-composer-glass-shell-with-context",
+                        showComposerContextStrip &&
+                          !isWatchmanControl &&
+                          "chat-composer-glass-shell-with-context",
                       )}
                     >
                       <div className="chat-composer-glass-host relative z-10 w-full rounded-[22px]">
@@ -5978,6 +5993,7 @@ function ChatViewContent(props: ChatViewProps) {
                             planSidebarOpen={planSidebarOpen}
                             runtimeMode={runtimeMode}
                             interactionMode={interactionMode}
+                            watchmanSurface={watchmanSurface}
                             lockedProvider={null}
                             providerStatuses={providerStatuses as ServerProvider[]}
                             activeProjectDefaultModelSelection={
@@ -5988,7 +6004,9 @@ function ChatViewContent(props: ChatViewProps) {
                             resolvedTheme={resolvedTheme}
                             settings={settings}
                             keybindings={keybindings}
-                            terminalOpen={Boolean(terminalUiState.terminalOpen)}
+                            terminalOpen={
+                              !isWatchmanControl && Boolean(terminalUiState.terminalOpen)
+                            }
                             gitCwd={gitCwd}
                             promptRef={promptRef}
                             composerImagesRef={composerImagesRef}
@@ -6024,10 +6042,12 @@ function ChatViewContent(props: ChatViewProps) {
                       </div>
                       <div className="min-h-0">
                         <div
-                          data-terminal-open={terminalUiState.terminalOpen ? "true" : undefined}
+                          data-terminal-open={
+                            !isWatchmanControl && terminalUiState.terminalOpen ? "true" : undefined
+                          }
                           className="relative z-0"
                         >
-                          {showComposerContextStrip && (
+                          {showComposerContextStrip && !isWatchmanControl && (
                             <div className="pointer-events-auto">
                               <BranchToolbar
                                 environmentId={activeThread.environmentId}
@@ -6068,7 +6088,7 @@ function ChatViewContent(props: ChatViewProps) {
               </div>
             </div>
 
-            {activeThreadRef && activePreviewMiniPlayer ? (
+            {activeThreadRef && activePreviewMiniPlayer && !isWatchmanControl ? (
               <ThreadPreviewMiniPlayer
                 key={`${activeThreadKey}:${activePreviewMiniPlayer.tabId}`}
                 threadRef={activeThreadRef}
@@ -6148,7 +6168,11 @@ function ChatViewContent(props: ChatViewProps) {
             key={mountedThreadKey}
             threadRef={mountedThreadRef}
             threadId={mountedThreadRef.threadId}
-            visible={mountedThreadKey === activeThreadKey && terminalUiState.terminalOpen}
+            visible={
+              !isWatchmanControl &&
+              mountedThreadKey === activeThreadKey &&
+              terminalUiState.terminalOpen
+            }
             launchContext={
               mountedThreadKey === activeThreadKey ? (activeTerminalLaunchContext ?? null) : null
             }
@@ -6163,7 +6187,7 @@ function ChatViewContent(props: ChatViewProps) {
         ))}
       </div>
 
-      {!shouldUsePlanSidebarSheet && rightPanelOpen && activeThreadRef ? (
+      {!shouldUsePlanSidebarSheet && visibleRightPanelOpen && activeThreadRef ? (
         <RightPanelTabs
           mode="inline"
           maximized={rightPanelMaximized}
@@ -6189,7 +6213,7 @@ function ChatViewContent(props: ChatViewProps) {
           {rightPanelContent}
         </RightPanelTabs>
       ) : null}
-      {shouldUsePlanSidebarSheet && rightPanelOpen && activeThreadRef ? (
+      {shouldUsePlanSidebarSheet && visibleRightPanelOpen && activeThreadRef ? (
         <RightPanelSheet open onClose={planSidebarOpen ? closePlanSidebar : closePreviewPanel}>
           <RightPanelTabs
             mode="sheet"

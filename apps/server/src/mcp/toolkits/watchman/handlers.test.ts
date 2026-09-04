@@ -24,6 +24,10 @@ const invocation: McpInvocationContext.McpInvocationScope = {
   capabilities: new Set(["preview", "watchman-control"]),
   issuedAt: 1,
 };
+const developerInvocation: McpInvocationContext.McpInvocationScope = {
+  ...invocation,
+  capabilities: new Set(["preview", "watchman-control", "watchman-developer-control"]),
+};
 const client = McpSchema.McpServerClient.of({
   clientId: 1,
   initializePayload: {
@@ -147,6 +151,17 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
     readonly path: string;
     readonly payload?: unknown;
   }> = [];
+  let hvacStatusResponse:
+    | ((request: Record<string, unknown>) => Record<string, unknown>)
+    | undefined;
+  let hallStatusResponse:
+    | ((request: Record<string, unknown>) => Record<string, unknown>)
+    | undefined;
+  let hallRequest: Record<string, unknown> | undefined;
+  let headStatusResponse:
+    | ((request: Record<string, unknown>) => Record<string, unknown>)
+    | undefined;
+  let headRequest: Record<string, unknown> | undefined;
   const oversizedTvMetadata = "x".repeat(50_000);
   const oversizedHvacMetadata = "y".repeat(50_000);
   const states = [
@@ -253,6 +268,7 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
     state("sensor.watchman_hvac_controller", "ready", {
       mode: "shadow",
       actuation_compiled_in: false,
+      exact_head_control: false,
       profile: "off",
       computed_pair_mask: "0b0000",
       effective_pair_mask: "0b0000",
@@ -303,7 +319,234 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
       readWellRunHistory: () => Effect.die("unused"),
       rest: (method, path, payload) => {
         calls.push({ method, path, ...(payload === undefined ? {} : { payload }) });
-        return method === "GET" ? freshStates(states) : Effect.succeed([]);
+        if (method === "GET") return freshStates(states);
+        if (
+          path === "/api/services/watchman_hvac/hall_request?return_response" ||
+          path === "/api/services/watchman_hvac/hall_request_status?return_response"
+        ) {
+          const request = payload as Record<string, unknown>;
+          if (path.includes("/hall_request?")) hallRequest = request;
+          const requested = hallRequest ?? request;
+          const desiredHall =
+            requested.hvac_mode === "off"
+              ? {
+                  hvac_mode: "off",
+                  setpoint_f: null,
+                  fan_mode: null,
+                  swing_mode: null,
+                  observed_at: null,
+                }
+              : {
+                  hvac_mode: requested.hvac_mode ?? "cool",
+                  setpoint_f:
+                    requested.hvac_mode === "fan_only" ? null : (requested.setpoint_f ?? 78),
+                  fan_mode: requested.fan_mode ?? "auto",
+                  swing_mode: requested.swing_mode ?? "stopped",
+                  observed_at: null,
+                };
+          const normalizedHallRequest = {
+            request_id: request.request_id,
+            ...desiredHall,
+            duration_minutes: null,
+            source: "t3_control",
+            created_at: "2026-07-31T20:00:10+00:00",
+            expires_at: null,
+          };
+          return Effect.succeed({
+            service_response: hallStatusResponse?.(request) ?? {
+              status: "verified",
+              operation_id: `hvac-hall:${String(request.request_id)}`,
+              request_id: request.request_id,
+              receipt: {
+                request_id: request.request_id,
+                revision: 1,
+                requested: normalizedHallRequest,
+                accepted: "accepted",
+                applied: "verified",
+                effective_head_mask: null,
+                applied_head_mask: null,
+                evidence: "execution:hall:1:test:1",
+                safety: [],
+                terminal_at: "2026-07-31T20:00:11+00:00",
+              },
+              hall_execution: {
+                status: "verified",
+                attempts: 1,
+                desired: desiredHall,
+                final: { ...desiredHall, observed_at: "2026-07-31T20:00:11+00:00" },
+                verified_at: "2026-07-31T20:00:11+00:00",
+                evidence: [],
+                applied: "verified",
+                effective: desiredHall,
+              },
+              monitor: null,
+              samsung_writes: false,
+            },
+          });
+        }
+        if (
+          path === "/api/services/watchman_hvac/head_request?return_response" ||
+          path === "/api/services/watchman_hvac/head_request_status?return_response"
+        ) {
+          const request = payload as Record<string, unknown>;
+          if (path.includes("/head_request?")) headRequest = request;
+          const requested = headRequest ?? request;
+          const heads = requested.heads as ReadonlyArray<number>;
+          const requestedHeadMask = heads.reduce((mask, head) => mask | (1 << (head - 1)), 0);
+          const desiredHeadState = Object.fromEntries(
+            Array.from({ length: 8 }, (_, index) => {
+              const head = index + 1;
+              return [
+                String(head),
+                heads.includes(head)
+                  ? {
+                      power: requested.power === "on",
+                      mode: requested.power === "on" ? (requested.hvac_mode ?? "cool") : null,
+                      setpoint_f: requested.power === "on" ? (requested.setpoint_f ?? 72) : null,
+                      fan_mode: requested.power === "on" ? (requested.fan_mode ?? "auto") : null,
+                      swing_mode: requested.power === "on" ? (requested.swing_mode ?? "off") : null,
+                    }
+                  : {
+                      power: false,
+                      mode: null,
+                      setpoint_f: null,
+                      fan_mode: null,
+                      swing_mode: null,
+                    },
+              ];
+            }),
+          );
+          const normalizedHeadRequest = {
+            request_id: request.request_id,
+            heads,
+            power: requested.power,
+            selection: requested.selection ?? "preserve",
+            hvac_mode: requested.hvac_mode ?? null,
+            setpoint_f: requested.setpoint_f ?? null,
+            fan_mode: requested.fan_mode ?? null,
+            swing_mode: requested.swing_mode ?? null,
+            duration_minutes: requested.duration_minutes ?? 60,
+            source: "t3_control",
+            requested_head_mask: requestedHeadMask,
+            owned_heads: heads,
+            resolved_desired: desiredHeadState,
+            created_at: "2026-07-31T20:00:10+00:00",
+            expires_at: "2026-07-31T21:00:10+00:00",
+          };
+          return Effect.succeed({
+            service_response: headStatusResponse?.(request) ?? {
+              status: "verified",
+              operation_id: `hvac-head:${String(request.request_id)}`,
+              request_id: request.request_id,
+              receipt: {
+                request_id: request.request_id,
+                revision: 1,
+                requested: normalizedHeadRequest,
+                accepted: "accepted",
+                applied: "verified",
+                effective_head_mask: requestedHeadMask,
+                applied_head_mask: requestedHeadMask,
+                evidence: "execution:head:1:test:1",
+                safety: [],
+                terminal_at: "2026-07-31T20:00:11+00:00",
+              },
+              head_execution: {
+                generation: "head:1:test:1",
+                status: "verified",
+                started_at: "2026-07-31T20:00:10+00:00",
+                finished_at: "2026-07-31T20:00:11+00:00",
+                desired_head_mask: requestedHeadMask,
+                observed_head_mask: requestedHeadMask,
+                desired_outdoor_mask: requestedHeadMask === 0 ? 0 : 1,
+                observed_outdoor_mask: requestedHeadMask === 0 ? 0 : 1,
+                desired_state: desiredHeadState,
+                pre_state: desiredHeadState,
+                final_state: desiredHeadState,
+                attempts: [],
+                wave_starts: [],
+                pair_handoffs: {},
+                error: null,
+                verified_at: "2026-07-31T20:00:11+00:00",
+                applied: "verified",
+                desired: desiredHeadState,
+                final: desiredHeadState,
+              },
+              monitor: null,
+              samsung_writes: true,
+            },
+          });
+        }
+        if (
+          path === "/api/services/watchman_hvac/request?return_response" ||
+          path === "/api/services/watchman_hvac/developer_pair_request?return_response" ||
+          path === "/api/services/watchman_hvac/request_status?return_response"
+        ) {
+          const request = payload as Record<string, unknown>;
+          const pairMask =
+            path.includes("request_status") || request.action === "party"
+              ? 15
+              : (request.pair_mask ?? 0);
+          const exactHeads = Array.isArray(request.targets)
+            ? request.targets.flatMap((target) =>
+                target && typeof target === "object" && "head" in target
+                  ? [(target as { head: unknown }).head]
+                  : [],
+              )
+            : undefined;
+          if (path.includes("request_status")) {
+            return Effect.succeed({
+              service_response: hvacStatusResponse?.(request) ?? {
+                status: "found",
+                request_id: request.request_id,
+                receipt: {
+                  request_id: request.request_id,
+                  revision: 1,
+                  requested: request,
+                  accepted: "accepted",
+                  applied: "verified",
+                  effective_pair_mask: pairMask,
+                  applied_pair_mask: pairMask,
+                  evidence: "execution:original",
+                  safety: [],
+                  terminal_at: "2026-07-31T20:00:10+00:00",
+                },
+                current_plan_generation: "current-plan",
+                current_plan_outcome: {
+                  request_id: request.request_id,
+                  plan_generation: "current-plan",
+                  execution_id: "test",
+                  applied: "verified",
+                  effective_pair_mask: pairMask,
+                  applied_pair_mask: pairMask,
+                  evidence: "execution:test",
+                  safety: [],
+                  terminal_at: "2026-07-31T20:00:11+00:00",
+                },
+                latest_plan_outcome: null,
+                plan_outcomes: [],
+                executions: [{ status: "verified", generation: "test" }],
+              },
+            });
+          }
+          return Effect.succeed({
+            service_response: {
+              request_id: request.request_id,
+              revision: 1,
+              requested: request,
+              accepted: "accepted",
+              applied: "verified",
+              effective_pair_mask: pairMask,
+              applied_pair_mask: pairMask,
+              effective_heads: exactHeads,
+              applied_heads: exactHeads,
+              evidence: "execution:test",
+              safety: [],
+              terminal_at: "2026-07-31T20:00:11+00:00",
+              executions: [{ status: "verified", generation: "test" }],
+            },
+          });
+        }
+        return Effect.succeed([]);
       },
     }),
   );
@@ -315,13 +558,17 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
     Layer.provideMerge(McpServer.McpServer.layer),
   );
 
-  const call = (name: string, args: Record<string, unknown>) =>
+  const call = (
+    name: string,
+    args: Record<string, unknown>,
+    scope: McpInvocationContext.McpInvocationScope = invocation,
+  ) =>
     Effect.gen(function* () {
       const server = yield* McpServer.McpServer;
       return yield* server
         .callTool({ name, arguments: args })
         .pipe(
-          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
           Effect.provideService(McpSchema.McpServerClient, client),
         );
     });
@@ -333,6 +580,7 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
         "watchman_automation",
         "watchman_history",
         "watchman_hvac_control",
+        "watchman_operation_status",
         "watchman_status",
         "watchman_tv_control",
         "watchman_water_control",
@@ -668,35 +916,30 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
       applied: "verified",
     });
 
-    const pairs = yield* call("watchman_hvac_control", {
-      operation: "pairs",
+    const exactHeadUnavailable = yield* call("watchman_hvac_control", {
+      operation: "heads",
       heads: [7],
-      action: "only",
-    });
-    expect(pairs.isError).toBe(false);
-    expect(
-      calls.find(
-        ({ path, payload }) =>
-          path === "/api/services/input_select/select_option" &&
-          (payload as { option?: string }).option === "D",
-      ),
-    ).toBeDefined();
-    expect(pairs.structuredContent).toMatchObject({
-      requested: { requested_pairs: "D" },
-      applied: "verified",
-    });
-
-    const pairsWithTarget = yield* call("watchman_hvac_control", {
-      operation: "pairs",
-      heads: [7, 8],
-      action: "only",
+      power: "on",
+      selection: "only",
       target_f: 72,
     });
-    expect(pairsWithTarget.isError).toBe(false);
-    expect(pairsWithTarget.structuredContent).toMatchObject({
-      requested: { requested_pairs: "D", target_f: 72 },
-      applied: "pending",
+    expect(exactHeadUnavailable.isError).toBe(false);
+    expect(exactHeadUnavailable.structuredContent).toMatchObject({
+      requested: { heads: [7], selection: "only", target_f: 72 },
+      accepted: "unavailable(v3_exact_head_not_cut_over)",
+      applied: "unavailable",
+      observed: { exact_head_control: false },
     });
+    expect(String(exactHeadUnavailable.structuredContent?.evidence)).toContain(
+      "was not broadened to its pair",
+    );
+    expect(
+      calls.find(
+        ({ path }) =>
+          path === "/api/services/input_select/select_option" ||
+          path === "/api/services/watchman_hvac/head_request?return_response",
+      ),
+    ).toBeUndefined();
 
     const invalidPartyEnd = yield* call("watchman_hvac_control", {
       operation: "party",
@@ -704,6 +947,709 @@ it.effect("keeps the Watchman MCP surface closed and controller-owned", () => {
       minutes: 60,
     });
     expect(invalidPartyEnd.isError).toBe(true);
+
+    const hvacController = states.find(
+      ({ entity_id }) => entity_id === "sensor.watchman_hvac_controller",
+    )!;
+    const legacyCallCount = calls.length;
+    const legacyTarget = yield* call("watchman_hvac_control", {
+      operation: "target",
+      target_f: 82,
+    });
+    expect(legacyTarget.isError).toBe(false);
+    expect(legacyTarget.structuredContent).toMatchObject({
+      correlation_id: expect.stringMatching(/^hvac-v2:/),
+      accepted: "submitted_unverified",
+      applied: "pending",
+      status_tracking: "unavailable(v2_no_durable_receipt)",
+    });
+    expect(legacyTarget.structuredContent).not.toHaveProperty("operation_id");
+    expect(String(legacyTarget.structuredContent?.evidence)).toContain(
+      "must not be reported as completed",
+    );
+    expect(
+      calls
+        .slice(legacyCallCount)
+        .find(
+          ({ path, payload }) =>
+            path === "/api/services/input_number/set_value" &&
+            (payload as { entity_id?: string }).entity_id ===
+              "input_number.hvac_party_setpoint_f" &&
+            (payload as { value?: number }).value === 82,
+        ),
+    ).toBeDefined();
+    expect(
+      calls
+        .slice(legacyCallCount)
+        .find(({ path }) => path === "/api/services/watchman_hvac/request?return_response"),
+    ).toBeUndefined();
+
+    const legacyHallCallCount = calls.length;
+    const legacyHall = yield* call("watchman_hvac_control", {
+      operation: "hall",
+      hall_mode: "cool",
+      hall_setpoint_f: 78,
+    });
+    expect(legacyHall.isError).toBe(false);
+    expect(legacyHall.structuredContent).toMatchObject({
+      applied: "pending",
+      requested: { hall_mode: "cool", hall_setpoint_f: 78 },
+    });
+    expect(
+      calls
+        .slice(legacyHallCallCount)
+        .find(
+          ({ path, payload }) =>
+            path === "/api/services/climate/set_temperature" &&
+            (payload as { entity_id?: string }).entity_id === "climate.hvac_inverter_hall" &&
+            (payload as { temperature?: number }).temperature === 25.6,
+        ),
+    ).toBeDefined();
+
+    const unsupportedLegacyHallCallCount = calls.length;
+    const unsupportedLegacyHallFan = yield* call("watchman_hvac_control", {
+      operation: "hall",
+      hall_fan_mode: "quiet",
+    });
+    expect(unsupportedLegacyHallFan.isError).toBe(true);
+    expect(calls.slice(unsupportedLegacyHallCallCount)).toHaveLength(1);
+    expect(calls.at(-1)?.method).toBe("GET");
+    expect(
+      calls
+        .slice(legacyHallCallCount)
+        .find(
+          ({ path, payload }) =>
+            path === "/api/services/climate/set_hvac_mode" &&
+            (payload as { entity_id?: string }).entity_id === "climate.hvac_inverter_hall" &&
+            (payload as { hvac_mode?: string }).hvac_mode === "cool",
+        ),
+    ).toBeDefined();
+
+    const preCutoverDeveloperCallCount = calls.length;
+    const preCutoverDeveloperPair = yield* call(
+      "watchman_hvac_control",
+      { operation: "pairs", pairs: ["D"], target_f: 72, fan_mode: "medium", minutes: 60 },
+      developerInvocation,
+    );
+    expect(preCutoverDeveloperPair.isError).toBe(false);
+    expect(preCutoverDeveloperPair.structuredContent).toMatchObject({
+      accepted: "unavailable(v3_controller_not_cut_over)",
+      applied: "unavailable",
+      requested: { pair_mask: 8, expanded_heads: [7, 8] },
+    });
+    expect(
+      calls.slice(preCutoverDeveloperCallCount).find(({ method }) => method === "POST"),
+    ).toBeUndefined();
+
+    hvacController.attributes.actuation_compiled_in = true;
+    const v3HallCallCount = calls.length;
+    const verifiedV3Hall = yield* call("watchman_hvac_control", {
+      operation: "hall",
+      hall_mode: "heat_cool",
+      hall_setpoint_f: 78,
+      hall_fan_mode: "strong",
+      hall_swing_mode: "rangefull",
+    });
+    expect(verifiedV3Hall.isError).toBe(false);
+    expect(verifiedV3Hall.structuredContent).toMatchObject({
+      operation_id: expect.stringMatching(/^hvac-hall:/),
+      accepted: "accepted",
+      applied: "verified",
+      requested: {
+        hvac_mode: "heat_cool",
+        setpoint_f: 78,
+        fan_mode: "strong",
+        swing_mode: "rangefull",
+        duration_minutes: null,
+        source: "t3_control",
+      },
+      observed: {
+        hall_execution: {
+          status: "verified",
+          desired: {
+            hvac_mode: "heat_cool",
+            setpoint_f: 78,
+            fan_mode: "strong",
+            swing_mode: "rangefull",
+          },
+          final: {
+            hvac_mode: "heat_cool",
+            setpoint_f: 78,
+            fan_mode: "strong",
+            swing_mode: "rangefull",
+          },
+          effective: {
+            hvac_mode: "heat_cool",
+            setpoint_f: 78,
+            fan_mode: "strong",
+            swing_mode: "rangefull",
+          },
+          applied: "verified",
+        },
+        samsung_writes: false,
+      },
+      evidence: "execution:hall:1:test:1",
+    });
+    expect(
+      calls
+        .slice(v3HallCallCount)
+        .find(
+          ({ path, payload }) =>
+            path === "/api/services/watchman_hvac/hall_request?return_response" &&
+            (payload as { hvac_mode?: string }).hvac_mode === "heat_cool" &&
+            (payload as { setpoint_f?: number }).setpoint_f === 78 &&
+            (payload as { fan_mode?: string }).fan_mode === "strong" &&
+            (payload as { swing_mode?: string }).swing_mode === "rangefull",
+        ),
+    ).toBeDefined();
+    expect(
+      calls
+        .slice(v3HallCallCount)
+        .find(
+          ({ path }) =>
+            path.startsWith("/api/services/climate/") ||
+            path === "/api/services/watchman_hvac/request?return_response",
+        ),
+    ).toBeUndefined();
+
+    const hallOperationId = (verifiedV3Hall.structuredContent as { operation_id: string })
+      .operation_id;
+    hallStatusResponse = (request) => ({
+      status: "safety_clamped",
+      request_id: request.request_id,
+      receipt: {
+        request_id: request.request_id,
+        requested: {
+          request_id: request.request_id,
+          hvac_mode: "heat_cool",
+          setpoint_f: 78,
+          fan_mode: "strong",
+          swing_mode: "rangefull",
+          duration_minutes: null,
+          source: "t3_control",
+          created_at: "2026-07-31T20:00:10+00:00",
+          expires_at: null,
+        },
+        accepted: "accepted",
+        applied: "safety_clamped",
+        evidence: "peak:36kw_hall_off_verified",
+        safety: ["peak:36kw"],
+        terminal_at: "2026-07-31T20:00:12+00:00",
+      },
+      hall_execution: {
+        status: "verified",
+        desired: {
+          hvac_mode: "off",
+          setpoint_f: null,
+          fan_mode: null,
+          swing_mode: null,
+          observed_at: null,
+        },
+        final: {
+          hvac_mode: "off",
+          setpoint_f: null,
+          fan_mode: null,
+          swing_mode: null,
+          observed_at: "2026-07-31T20:00:12+00:00",
+        },
+        effective: {
+          hvac_mode: "off",
+          setpoint_f: null,
+          fan_mode: null,
+          swing_mode: null,
+          observed_at: null,
+        },
+        applied: "safety_clamped",
+        attempts: 1,
+        verified_at: "2026-07-31T20:00:12+00:00",
+        evidence: [],
+      },
+      monitor: null,
+      samsung_writes: false,
+    });
+    const safetyClampedHall = yield* call("watchman_operation_status", {
+      operation_id: hallOperationId,
+    });
+    expect(safetyClampedHall.isError).toBe(false);
+    expect(safetyClampedHall.structuredContent).toMatchObject({
+      operation_id: hallOperationId,
+      applied: "safety_clamped",
+      evidence: "peak:36kw_hall_off_verified",
+      safety: ["peak:36kw"],
+      observed: {
+        hall_execution: {
+          effective: { hvac_mode: "off" },
+          applied: "safety_clamped",
+        },
+        samsung_writes: false,
+      },
+    });
+    hallStatusResponse = (request) => ({
+      status: "pending",
+      request_id: request.request_id,
+      receipt: {
+        request_id: request.request_id,
+        requested: {
+          request_id: request.request_id,
+          hvac_mode: "heat_cool",
+          setpoint_f: 78,
+          fan_mode: "strong",
+          swing_mode: "rangefull",
+          duration_minutes: null,
+          source: "t3_control",
+          created_at: "2026-07-31T20:00:10+00:00",
+          expires_at: null,
+        },
+        accepted: "accepted",
+        applied: "pending",
+        evidence: "hall direct-state verification is pending",
+        safety: [],
+        terminal_at: null,
+      },
+      hall_execution: null,
+      monitor: null,
+      samsung_writes: false,
+    });
+    const pendingHall = yield* call("watchman_operation_status", {
+      operation_id: hallOperationId,
+    });
+    expect(pendingHall.isError).toBe(false);
+    expect(pendingHall.structuredContent).toMatchObject({
+      operation_id: hallOperationId,
+      applied: "pending",
+      evidence: "hall direct-state verification is pending",
+      observed: { samsung_writes: false },
+    });
+    hallStatusResponse = undefined;
+
+    const invalidHallOffCallCount = calls.length;
+    const invalidHallOff = yield* call("watchman_hvac_control", {
+      operation: "hall",
+      hall_mode: "off",
+      hall_fan_mode: "auto",
+    });
+    expect(invalidHallOff.isError).toBe(true);
+    expect(calls.slice(invalidHallOffCallCount)).toHaveLength(1);
+    expect(calls.at(-1)?.method).toBe("GET");
+
+    const invalidHallFanOnlyCallCount = calls.length;
+    const invalidHallFanOnly = yield* call("watchman_hvac_control", {
+      operation: "hall",
+      hall_mode: "fan_only",
+      hall_setpoint_f: 78,
+    });
+    expect(invalidHallFanOnly.isError).toBe(true);
+    expect(calls.slice(invalidHallFanOnlyCallCount)).toHaveLength(1);
+    expect(calls.at(-1)?.method).toBe("GET");
+
+    const verifiedDeveloperHall = yield* call(
+      "watchman_hvac_control",
+      { operation: "hall", hall_setpoint_f: 46 },
+      developerInvocation,
+    );
+    expect(verifiedDeveloperHall.isError).toBe(false);
+    expect(verifiedDeveloperHall.structuredContent).toMatchObject({
+      operation_id: expect.stringMatching(/^hvac-hall:/),
+      applied: "verified",
+      requested: {
+        hvac_mode: "cool",
+        setpoint_f: 46,
+        fan_mode: "auto",
+        swing_mode: "stopped",
+        duration_minutes: null,
+        source: "t3_control",
+      },
+    });
+
+    hallStatusResponse = (request) => ({ status: "accepted", request_id: request.request_id });
+    const acknowledgementOnlyCallCount = calls.length;
+    const acknowledgementOnlyHall = yield* call("watchman_hvac_control", {
+      operation: "hall",
+      hall_mode: "off",
+    });
+    expect(acknowledgementOnlyHall.isError).toBe(true);
+    expect(
+      calls.slice(acknowledgementOnlyCallCount).filter(({ method }) => method === "POST"),
+    ).toHaveLength(1);
+    expect(calls.at(-1)?.path).toBe("/api/services/watchman_hvac/hall_request?return_response");
+    hallStatusResponse = undefined;
+
+    const verifiedTarget = yield* call("watchman_hvac_control", {
+      operation: "target",
+      target_f: 82,
+    });
+    expect(verifiedTarget.isError).toBe(false);
+    expect(verifiedTarget.structuredContent).toMatchObject({
+      operation_id: expect.stringMatching(/^hvac:/),
+      accepted: "accepted",
+      applied: "verified",
+      requested: { action: "party", setpoint_f: 82, duration_minutes: 60 },
+      observed: {
+        effective_pair_mask: 15,
+        applied_pair_mask: 15,
+        execution: { generation: "test", status: "verified" },
+      },
+      evidence: "execution:test",
+    });
+    const verifiedTargetOperation = (verifiedTarget.structuredContent as { operation_id: string })
+      .operation_id;
+    const verifiedTargetStatus = yield* call("watchman_operation_status", {
+      operation_id: verifiedTargetOperation,
+    });
+    expect(verifiedTargetStatus.isError).toBe(false);
+    expect(verifiedTargetStatus.structuredContent).toMatchObject({
+      operation_id: verifiedTargetOperation,
+      applied: "verified",
+      observed: { effective_pair_mask: 15, applied_pair_mask: 15 },
+    });
+
+    hvacStatusResponse = (request) => ({
+      status: "found",
+      request_id: request.request_id,
+      receipt: {
+        request_id: request.request_id,
+        requested: { request_id: request.request_id, action: "party" },
+        accepted: "accepted",
+        applied: "superseded",
+        effective_pair_mask: null,
+        applied_pair_mask: null,
+        evidence: "superseded_by:newer-request",
+        safety: [],
+        terminal_at: "2026-07-31T20:00:12+00:00",
+      },
+      current_plan_generation: null,
+      current_plan_outcome: null,
+      latest_plan_outcome: null,
+      plan_outcomes: [],
+      executions: [],
+    });
+    const supersededStatus = yield* call("watchman_operation_status", {
+      operation_id: "hvac:superseded-request",
+    });
+    expect(supersededStatus.isError).toBe(false);
+    expect(supersededStatus.structuredContent).toMatchObject({
+      operation_id: "hvac:superseded-request",
+      applied: "superseded",
+      evidence: "superseded_by:newer-request",
+      observed: { terminal_at: "2026-07-31T20:00:12+00:00" },
+    });
+
+    hvacStatusResponse = (request) => ({
+      status: "found",
+      request_id: request.request_id,
+      receipt: {
+        request_id: request.request_id,
+        requested: { request_id: request.request_id, action: "party" },
+        accepted: "accepted",
+        applied: "verified",
+        effective_pair_mask: 15,
+        applied_pair_mask: 15,
+        evidence: "execution:original",
+        safety: [],
+        terminal_at: "2026-07-31T20:00:10+00:00",
+      },
+      current_plan_generation: "current-plan",
+      current_plan_outcome: {
+        request_id: request.request_id,
+        plan_generation: "current-plan",
+        execution_id: "current-execution",
+        applied: "verified",
+        effective_pair_mask: 7,
+        applied_pair_mask: 7,
+        evidence: "execution:current-execution",
+        safety: [],
+        terminal_at: "2026-07-31T20:00:13+00:00",
+      },
+      latest_plan_outcome: {
+        execution_id: "later-execution",
+        applied: "failed",
+      },
+      plan_outcomes: [],
+      executions: [
+        { generation: "current-execution", status: "verified" },
+        { generation: "later-execution", status: "failed" },
+      ],
+    });
+    const currentExecutionStatus = yield* call("watchman_operation_status", {
+      operation_id: "hvac:current-execution-request",
+    });
+    expect(currentExecutionStatus.isError).toBe(false);
+    expect(currentExecutionStatus.structuredContent).toMatchObject({
+      applied: "verified",
+      evidence: "execution:current-execution",
+      observed: {
+        effective_pair_mask: 7,
+        applied_pair_mask: 7,
+        execution: { generation: "current-execution", status: "verified" },
+      },
+    });
+    hvacStatusResponse = undefined;
+    expect(
+      calls.find(
+        ({ path, payload }) =>
+          path === "/api/services/watchman_hvac/request?return_response" &&
+          (payload as { action?: string }).action === "party" &&
+          (payload as { duration_minutes?: number }).duration_minutes === 60,
+      ),
+    ).toBeDefined();
+
+    const automatic = yield* call("watchman_hvac_control", {
+      operation: "mode",
+      mode: "Auto",
+    });
+    expect(automatic.isError).toBe(false);
+    expect(
+      calls.find(
+        ({ path, payload }) =>
+          path === "/api/services/watchman_hvac/request?return_response" &&
+          (payload as { action?: string }).action === "auto",
+      ),
+    ).toBeDefined();
+
+    const controlPair = yield* call("watchman_hvac_control", {
+      operation: "pairs",
+      pairs: ["D"],
+      target_f: 72,
+      fan_mode: "medium",
+      minutes: 60,
+    });
+    expect(controlPair.isError).toBe(true);
+    expect(
+      calls.find(
+        ({ path }) => path === "/api/services/watchman_hvac/developer_pair_request?return_response",
+      ),
+    ).toBeUndefined();
+
+    const verifiedDeveloperPair = yield* call(
+      "watchman_hvac_control",
+      {
+        operation: "pairs",
+        pairs: ["D"],
+        target_f: 72,
+        fan_mode: "medium",
+        minutes: 60,
+      },
+      developerInvocation,
+    );
+    expect(verifiedDeveloperPair.isError).toBe(false);
+    expect(verifiedDeveloperPair.structuredContent).toMatchObject({
+      operation_id: expect.stringMatching(/^hvac:/),
+      applied: "verified",
+      requested: { pair_mask: 8, fan_mode: "medium" },
+      observed: { effective_pair_mask: 8, applied_pair_mask: 8 },
+    });
+    expect(
+      calls.find(
+        ({ path, payload }) =>
+          path === "/api/services/watchman_hvac/developer_pair_request?return_response" &&
+          (payload as { pair_mask?: number }).pair_mask === 8 &&
+          (payload as { setpoint_f?: number }).setpoint_f === 72 &&
+          (payload as { fan_mode?: string }).fan_mode === "medium",
+      ),
+    ).toBeDefined();
+
+    const exactHeadCallCount = calls.length;
+    const verifiedExactHead = yield* call("watchman_hvac_control", {
+      operation: "heads",
+      heads: [1],
+      power: "on",
+      selection: "preserve",
+      head_mode: "cool",
+      target_f: 72,
+      fan_mode: "low",
+      minutes: 60,
+    });
+    expect(verifiedExactHead.isError).toBe(false);
+    expect(verifiedExactHead.structuredContent).toMatchObject({
+      operation_id: expect.stringMatching(/^hvac-head:/),
+      accepted: "accepted",
+      applied: "verified",
+      requested: {
+        heads: [1],
+        power: "on",
+        selection: "preserve",
+        hvac_mode: "cool",
+        setpoint_f: 72,
+        fan_mode: "low",
+        swing_mode: null,
+        duration_minutes: 60,
+        source: "t3_control",
+        requested_head_mask: 1,
+      },
+      observed: {
+        effective_head_mask: 1,
+        applied_head_mask: 1,
+        head_execution: {
+          status: "verified",
+          desired_head_mask: 1,
+          observed_head_mask: 1,
+          desired_state: { 1: { power: true } },
+          final_state: { 1: { power: true } },
+          desired: { 1: { power: true } },
+          final: { 1: { power: true } },
+          applied: "verified",
+        },
+        samsung_writes: true,
+      },
+    });
+    const exactHeadRequest = calls
+      .slice(exactHeadCallCount)
+      .find(({ path }) => path === "/api/services/watchman_hvac/head_request?return_response");
+    expect(exactHeadRequest?.payload).toEqual({
+      request_id: expect.any(String),
+      heads: [1],
+      power: "on",
+      selection: "preserve",
+      hvac_mode: "cool",
+      setpoint_f: 72,
+      fan_mode: "low",
+      duration_minutes: 60,
+    });
+    expect(
+      calls
+        .slice(exactHeadCallCount)
+        .find(
+          ({ path }) =>
+            path === "/api/services/watchman_hvac/request?return_response" ||
+            path === "/api/services/watchman_hvac/developer_pair_request?return_response" ||
+            path.startsWith("/api/services/climate/"),
+        ),
+    ).toBeUndefined();
+    const exactHeadOperationId = (verifiedExactHead.structuredContent as { operation_id: string })
+      .operation_id;
+    const exactHeadStatus = yield* call("watchman_operation_status", {
+      operation_id: exactHeadOperationId,
+    });
+    expect(exactHeadStatus.isError).toBe(false);
+    expect(exactHeadStatus.structuredContent).toMatchObject({
+      operation_id: exactHeadOperationId,
+      applied: "verified",
+      observed: {
+        effective_head_mask: 1,
+        applied_head_mask: 1,
+        head_execution: {
+          status: "verified",
+          desired_head_mask: 1,
+          observed_head_mask: 1,
+          applied: "verified",
+        },
+      },
+    });
+    headStatusResponse = (request) => ({
+      status: "safety_clamped",
+      operation_id: exactHeadOperationId,
+      request_id: request.request_id,
+      receipt: {
+        request_id: request.request_id,
+        requested: {
+          request_id: request.request_id,
+          heads: [1],
+          power: "on",
+          selection: "preserve",
+          hvac_mode: "cool",
+          setpoint_f: 72,
+          fan_mode: "low",
+          swing_mode: null,
+          duration_minutes: 60,
+          source: "t3_control",
+          requested_head_mask: 1,
+          owned_heads: [1],
+          resolved_desired: { 1: { power: true } },
+          created_at: "2026-07-31T20:00:10+00:00",
+          expires_at: "2026-07-31T21:00:10+00:00",
+        },
+        accepted: "accepted",
+        applied: "safety_clamped",
+        effective_head_mask: 0,
+        applied_head_mask: 0,
+        evidence: "peak constraint kept requested head off",
+        safety: ["peak:additions_blocked"],
+        terminal_at: "2026-07-31T20:00:12+00:00",
+      },
+      head_execution: {
+        generation: "head:1:test:2",
+        status: "verified",
+        started_at: "2026-07-31T20:00:11+00:00",
+        finished_at: "2026-07-31T20:00:12+00:00",
+        desired_head_mask: 0,
+        observed_head_mask: 0,
+        desired_outdoor_mask: 0,
+        observed_outdoor_mask: 0,
+        desired_state: { 1: { power: false } },
+        pre_state: { 1: { power: false } },
+        final_state: { 1: { power: false } },
+        attempts: [],
+        wave_starts: [],
+        pair_handoffs: {},
+        error: null,
+        verified_at: "2026-07-31T20:00:12+00:00",
+        applied: "safety_clamped",
+        desired: { 1: { power: false } },
+        final: { 1: { power: false } },
+      },
+      monitor: null,
+      samsung_writes: true,
+    });
+    const safetyClampedHead = yield* call("watchman_operation_status", {
+      operation_id: exactHeadOperationId,
+    });
+    expect(safetyClampedHead.isError).toBe(false);
+    expect(safetyClampedHead.structuredContent).toMatchObject({
+      operation_id: exactHeadOperationId,
+      applied: "safety_clamped",
+      evidence: "peak constraint kept requested head off",
+      safety: ["peak:additions_blocked"],
+      observed: {
+        effective_head_mask: 0,
+        applied_head_mask: 0,
+        head_execution: {
+          status: "verified",
+          desired_head_mask: 0,
+          observed_head_mask: 0,
+          final_state: { 1: { power: false } },
+          final: { 1: { power: false } },
+          applied: "safety_clamped",
+        },
+        samsung_writes: true,
+      },
+    });
+
+    headStatusResponse = (request) => ({
+      status: "not_found",
+      operation_id: `hvac-head:${String(request.request_id)}`,
+      request_id: request.request_id,
+      receipt: null,
+      head_execution: null,
+      monitor: null,
+      samsung_writes: true,
+    });
+    const missingHead = yield* call("watchman_operation_status", {
+      operation_id: "hvac-head:missing-head-request",
+    });
+    expect(missingHead.isError).toBe(false);
+    expect(missingHead.structuredContent).toMatchObject({
+      operation_id: "hvac-head:missing-head-request",
+      accepted: "not_found",
+      applied: "unavailable",
+      observed: { samsung_writes: true },
+    });
+    headStatusResponse = undefined;
+
+    const timedOff = yield* call("watchman_hvac_control", {
+      operation: "mode",
+      mode: "Off",
+      minutes: 10,
+    });
+    expect(timedOff.isError).toBe(false);
+    expect(
+      calls.find(
+        ({ path, payload }) =>
+          path === "/api/services/watchman_hvac/request?return_response" &&
+          (payload as { action?: string }).action === "off" &&
+          (payload as { duration_minutes?: number }).duration_minutes === 10,
+      ),
+    ).toBeDefined();
+    hvacController.attributes.actuation_compiled_in = false;
   }).pipe(Effect.provide(TestLayer));
 });
 
@@ -1245,15 +2191,33 @@ it.effect("files exact tvd requests and passes daemon receipts through unchanged
     yield* TestClock.adjust("2 millis");
     const hold = yield* Fiber.join(holdFiber);
     expect(hold.isError).toBe(false);
-    expect(hold.structuredContent).toEqual(expectedReceipt);
+    expect(hold.structuredContent).toMatchObject(expectedReceipt!);
     expect(receiptPolls).toBe(3);
     expect(filed).toHaveLength(1);
     const request = filed[0]!;
+    expect(hold.structuredContent).toMatchObject({
+      operation_id: `tv:${request.request_id}`,
+    });
     expect(request.request_id).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
     );
     expect(request.request_id).toBe(request.request_id.toLowerCase());
     expect(typeof request.issued_at).toBe("number");
+    const operationStatus = yield* server
+      .callTool({
+        name: "watchman_operation_status",
+        arguments: { operation_id: `tv:${request.request_id}` },
+      })
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+    expect(operationStatus.isError).toBe(false);
+    expect(operationStatus.structuredContent).toMatchObject({
+      operation_id: `tv:${request.request_id}`,
+      applied: "verified",
+      evidence: "hold state was journaled and witnessed",
+    });
     const filedBytes = yield* encodeJson(request);
     expect(filedBytes).toBe(
       `{"schema":1,"request_id":"${request.request_id}","source":"t3","screen":"d","intent":"hold","payload":{"expires_at":1003600},"lease":{"class":"hold","expires_at":1003600},"issued_at":1000000,"ttl_s":120}`,
@@ -1267,7 +2231,7 @@ it.effect("files exact tvd requests and passes daemon receipts through unchanged
       power: "on",
     });
     expect(observeOnly.isError).toBe(false);
-    expect(observeOnly.structuredContent).toEqual(expectedReceipt);
+    expect(observeOnly.structuredContent).toMatchObject(expectedReceipt!);
     expect(observeOnly.structuredContent).toMatchObject({
       accepted: "rejected(observe_only)",
       applied: "failed",

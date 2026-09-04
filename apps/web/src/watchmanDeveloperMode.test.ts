@@ -5,6 +5,7 @@ import {
   resolveWatchmanNewConversationModelSelection,
   selectedWatchmanAgent,
   tryUnlockWatchmanDeveloperMode,
+  watchmanSurfaceForModelSelection,
   WATCHMAN_DEVELOPER_UNLOCK_KEY,
 } from "./watchmanDeveloperMode";
 
@@ -46,6 +47,22 @@ describe("Watchman Developer mode unlock", () => {
         ],
       }),
     ).toBe("watchman-developer");
+  });
+
+  it("derives only the two Watchman surfaces from model state", () => {
+    expect(
+      watchmanSurfaceForModelSelection({
+        options: [{ id: "agent", value: "watchman-control" }],
+      }),
+    ).toBe("control");
+    expect(
+      watchmanSurfaceForModelSelection({
+        options: [{ id: "agent", value: "watchman-developer" }],
+      }),
+    ).toBe("developer");
+    expect(
+      watchmanSurfaceForModelSelection({ options: [{ id: "agent", value: "build" }] }),
+    ).toBeNull();
   });
 
   it("uses the Watchman project default instead of unrelated sticky provider state", () => {

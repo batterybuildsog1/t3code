@@ -50,6 +50,7 @@ import {
   isWatchmanControlProviderSelectionAllowed,
   makeProviderServiceLive,
   shouldGrantWatchmanControlCapability,
+  shouldGrantWatchmanDeveloperControlCapability,
 } from "./ProviderService.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
@@ -147,6 +148,47 @@ it("grants Watchman MCP control only to a Watchman agent in the canonical projec
       provider: OPENCODE_DRIVER,
       cwd: "/srv/watchman",
       projectRoot: "/srv/watchman",
+    }),
+    false,
+  );
+});
+
+it("grants developer control only to the Developer agent in the Watchman project", () => {
+  const developer = createModelSelection(codexInstanceId, "gpt-5.6-codex", [
+    { id: "agent", value: "watchman-developer" },
+  ]);
+  const control = createModelSelection(ProviderInstanceId.make("opencode"), "xai/grok-4.5", [
+    { id: "agent", value: "watchman-control" },
+  ]);
+
+  assert.equal(
+    shouldGrantWatchmanDeveloperControlCapability({
+      modelSelection: developer,
+      cwd: "/srv/watchman",
+      projectRoot: "/srv/watchman",
+    }),
+    true,
+  );
+  assert.equal(
+    shouldGrantWatchmanDeveloperControlCapability({
+      modelSelection: control,
+      cwd: "/srv/watchman",
+      projectRoot: "/srv/watchman",
+    }),
+    false,
+  );
+  assert.equal(
+    shouldGrantWatchmanDeveloperControlCapability({
+      modelSelection: developer,
+      cwd: "/srv/other",
+      projectRoot: "/srv/watchman",
+    }),
+    false,
+  );
+  assert.equal(
+    shouldGrantWatchmanDeveloperControlCapability({
+      modelSelection: developer,
+      cwd: "/srv/watchman",
     }),
     false,
   );

@@ -14,6 +14,7 @@ import { WatchmanControlError, WatchmanToolkit } from "./tools.ts";
 type WatchmanToolName =
   | "watchman_status"
   | "watchman_history"
+  | "watchman_operation_status"
   | "watchman_tv_control"
   | "watchman_hvac_control"
   | "watchman_water_control"
@@ -55,15 +56,21 @@ const WellRunHistory = Schema.Struct({
 const decodeWellRunHistory = Schema.decodeUnknownEffect(WellRunHistory);
 const WELL_RUN_HISTORY_MAX_AGE_SECONDS = 15 * 60;
 const mutationSemaphore = Effect.runSync(Semaphore.make(1));
+const productionHvacAdmissionSemaphore = Effect.runSync(Semaphore.make(1));
+const headHvacAdmissionSemaphore = Effect.runSync(Semaphore.make(1));
+const hallHvacAdmissionSemaphore = Effect.runSync(Semaphore.make(1));
 
 const screenLetters = ["a", "b", "c", "d"] as const;
-type AppliedState = "verified" | "pending" | "rejected" | "unavailable";
-const pairHeads = {
-  A: [1, 2],
-  B: [3, 4],
-  C: [5, 6],
-  D: [7, 8],
-} as const;
+type AppliedState =
+  | "verified"
+  | "pending"
+  | "deferred"
+  | "safety_clamped"
+  | "failed"
+  | "superseded"
+  | "recovery_required"
+  | "rejected"
+  | "unavailable";
 const hallCelsius = new Map([
   [75, 23.9],
   [76, 24.4],
@@ -103,6 +110,7 @@ const requireCapability = Effect.fn("WatchmanToolkit.requireCapability")(functio
       "This conversation is not scoped to the canonical Watchman Control environment.",
     );
   }
+  return invocation;
 });
 
 const controller = <A>(
@@ -143,6 +151,180 @@ const callService = Effect.fn("WatchmanToolkit.callService")(function* (
 ) {
   const cli = yield* WatchmanHaCli.WatchmanHaCli;
   yield* controller(tool, cli.rest("POST", `/api/services/${domain}/${service}`, data));
+});
+
+const responseRecord = (
+  tool: WatchmanToolName,
+  raw: unknown,
+): Effect.Effect<Record<string, unknown>, WatchmanControlError> => {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return Effect.fail(
+      fail(tool, "invalid_response", "Home Assistant returned an invalid service response."),
+    );
+  }
+  const envelope = raw as Record<string, unknown>;
+  const serviceResponse = envelope.service_response;
+  if (
+    serviceResponse === null ||
+    typeof serviceResponse !== "object" ||
+    Array.isArray(serviceResponse)
+  ) {
+    return Effect.fail(
+      fail(tool, "invalid_response", "Home Assistant omitted the requested service receipt."),
+    );
+  }
+  return Effect.succeed(serviceResponse as Record<string, unknown>);
+};
+
+const callServiceResponse = Effect.fn("WatchmanToolkit.callServiceResponse")(function* (
+  tool: WatchmanToolName,
+  service: string,
+  data: Record<string, unknown>,
+) {
+  const cli = yield* WatchmanHaCli.WatchmanHaCli;
+  const raw = yield* controller(
+    tool,
+    cli.rest("POST", `/api/services/watchman_hvac/${service}?return_response`, data),
+  );
+  return yield* responseRecord(tool, raw);
+});
+
+const hvacReceiptApplied = (receipt: Record<string, unknown>): AppliedState | undefined => {
+  const applied = receipt.applied;
+  return typeof applied === "string" &&
+    [
+      "verified",
+      "pending",
+      "deferred",
+      "safety_clamped",
+      "failed",
+      "superseded",
+      "recovery_required",
+      "rejected",
+      "unavailable",
+    ].includes(applied)
+    ? (applied as AppliedState)
+    : undefined;
+};
+
+const hvacStatusView = (raw: Record<string, unknown>): Record<string, unknown> => {
+  const nestedReceipt = raw.receipt;
+  if (nestedReceipt === null || typeof nestedReceipt !== "object" || Array.isArray(nestedReceipt)) {
+    return raw;
+  }
+  const receipt = nestedReceipt as Record<string, unknown>;
+  const nestedOutcome = raw.current_plan_outcome;
+  const outcome =
+    nestedOutcome !== null && typeof nestedOutcome === "object" && !Array.isArray(nestedOutcome)
+      ? (nestedOutcome as Record<string, unknown>)
+      : undefined;
+  const currentPlanPending =
+    typeof raw.current_plan_generation === "string" && outcome === undefined;
+  return {
+    ...receipt,
+    ...(outcome ??
+      (currentPlanPending
+        ? {
+            applied: "pending",
+            effective_pair_mask: undefined,
+            applied_pair_mask: undefined,
+            evidence: `request_id ${String(raw.request_id)} has no terminal outcome for its current policy plan.`,
+            safety: [],
+            terminal_at: undefined,
+            execution_id: undefined,
+          }
+        : {})),
+    request_id: raw.request_id ?? receipt.request_id,
+    executions: raw.executions,
+    current_plan_generation: raw.current_plan_generation,
+    latest_plan_outcome: raw.latest_plan_outcome,
+    plan_outcomes: raw.plan_outcomes,
+    hall_execution: raw.hall_execution ?? receipt.hall_execution,
+    head_execution: raw.head_execution ?? receipt.head_execution,
+    monitor: raw.monitor ?? receipt.monitor,
+    samsung_writes: raw.samsung_writes ?? receipt.samsung_writes,
+  };
+};
+
+const hvacExecutionForStatus = (receipt: Record<string, unknown>): unknown => {
+  if (!Array.isArray(receipt.executions)) return undefined;
+  const executionId = receipt.execution_id;
+  if (typeof executionId !== "string") return receipt.executions.at(-1);
+  return receipt.executions.find(
+    (candidate) =>
+      candidate !== null &&
+      typeof candidate === "object" &&
+      !Array.isArray(candidate) &&
+      (candidate as Record<string, unknown>).generation === executionId,
+  );
+};
+
+const submitVerifiedHvacV3 = Effect.fn("WatchmanToolkit.submitVerifiedHvacV3")(function* (
+  tool: WatchmanToolName,
+  service: "request" | "developer_pair_request" | "hall_request" | "head_request",
+  payload: Record<string, unknown>,
+  requested: Record<string, unknown>,
+  options: {
+    readonly operationPrefix: "hvac" | "hvac-hall" | "hvac-head";
+    readonly statusService: "request_status" | "hall_request_status" | "head_request_status";
+  } = { operationPrefix: "hvac", statusService: "request_status" },
+) {
+  const admissionSemaphore =
+    service === "hall_request"
+      ? hallHvacAdmissionSemaphore
+      : service === "head_request"
+        ? headHvacAdmissionSemaphore
+        : productionHvacAdmissionSemaphore;
+  let receipt = hvacStatusView(
+    yield* admissionSemaphore.withPermits(1)(callServiceResponse(tool, service, payload)),
+  );
+  const requestId = payload.request_id;
+  if (receipt.request_id !== requestId || hvacReceiptApplied(receipt) === undefined) {
+    return yield* fail(tool, "invalid_response", "HVAC acceptance receipt was not correlated.");
+  }
+  const deadline = DateTime.toEpochMillis(yield* DateTime.now) + 35_000;
+  while (hvacReceiptApplied(receipt) === "pending") {
+    const now = DateTime.toEpochMillis(yield* DateTime.now);
+    if (now >= deadline) break;
+    yield* Effect.sleep(Duration.millis(Math.min(500, deadline - now)));
+    receipt = hvacStatusView(
+      yield* callServiceResponse(tool, options.statusService, {
+        request_id: requestId,
+      }),
+    );
+    if (receipt.request_id !== requestId || hvacReceiptApplied(receipt) === undefined) {
+      return yield* fail(tool, "invalid_response", "HVAC status receipt lost correlation.");
+    }
+  }
+  const applied = hvacReceiptApplied(receipt) ?? "unavailable";
+  return mutationResult({
+    operationId: `${options.operationPrefix}:${String(requestId)}`,
+    requested: receipt.requested ?? { ...requested, request_id: requestId },
+    accepted: receipt.accepted ?? true,
+    applied,
+    observed: {
+      request_id: requestId,
+      effective_pair_mask: receipt.effective_pair_mask,
+      applied_pair_mask: receipt.applied_pair_mask,
+      effective_heads: receipt.effective_heads,
+      applied_heads: receipt.applied_heads,
+      effective_head_mask: receipt.effective_head_mask,
+      applied_head_mask: receipt.applied_head_mask,
+      terminal_at: receipt.terminal_at,
+      execution: hvacExecutionForStatus(receipt),
+      hall_execution: receipt.hall_execution,
+      head_execution: receipt.head_execution,
+      monitor: receipt.monitor,
+      samsung_writes: receipt.samsung_writes,
+    },
+    evidence:
+      applied === "pending"
+        ? `request_id ${String(requestId)} remains pending after 35 seconds; poll its durable receipt instead of assuming success.`
+        : typeof receipt.evidence === "string"
+          ? receipt.evidence
+          : `request_id ${String(requestId)} reached durable ${applied}.`,
+    safety: receipt.safety,
+  });
 });
 
 const compactState = (
@@ -191,6 +373,7 @@ const compactHvacControllerState = (states: ReadonlyMap<string, HaState>) => {
     [
       "mode",
       "actuation_compiled_in",
+      "exact_head_control",
       "profile",
       "computed_pair_mask",
       "effective_pair_mask",
@@ -694,6 +877,7 @@ const history = Effect.fn("WatchmanToolkit.history")(function* (input: {
 });
 
 const mutationResult = (input: {
+  readonly operationId?: string;
   readonly requested: unknown;
   readonly accepted?: unknown;
   readonly applied: AppliedState;
@@ -701,6 +885,7 @@ const mutationResult = (input: {
   readonly evidence: string;
   readonly safety?: unknown;
 }) => ({
+  ...(input.operationId === undefined ? {} : { operation_id: input.operationId }),
   requested: input.requested,
   accepted: input.accepted ?? (input.applied !== "rejected" && input.applied !== "unavailable"),
   applied: input.applied,
@@ -898,7 +1083,12 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
   const deadlineMs = pollStartedMs + receiptPollBudgetMs;
   while (true) {
     const receiptResult = yield* Effect.result(spool.readReceipt(requestId));
-    if (Result.isSuccess(receiptResult)) return receiptResult.success;
+    if (Result.isSuccess(receiptResult)) {
+      return {
+        operation_id: `tv:${requestId}`,
+        ...receiptResult.success,
+      };
+    }
     if (receiptResult.failure.reason !== "not_found") {
       return yield* tvdController(tool, Effect.fail(receiptResult.failure));
     }
@@ -910,6 +1100,7 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
   }
 
   return mutationResult({
+    operationId: `tv:${requestId}`,
     requested: { request_id: requestId, intent: input.operation, screen: input.screen },
     accepted: "filed",
     applied: "pending",
@@ -918,190 +1109,527 @@ const tvControl = Effect.fn("WatchmanToolkit.tvControl")(function* (input: {
   });
 });
 
-const selectedPairMask = (heads: ReadonlyArray<number>): string =>
-  Object.entries(pairHeads)
-    .filter(([, pair]) => pair.some((head) => heads.includes(head)))
-    .map(([pair]) => pair)
-    .join("");
-
-const updatePairMask = (current: string, selected: string, action: "on" | "off" | "only") => {
-  const have = new Set(current === "None" ? [] : [...current]);
-  const chosen = new Set(selected);
-  if (action === "only") return selected || "None";
-  for (const pair of chosen) {
-    if (action === "on") {
-      have.add(pair);
-    } else {
-      have.delete(pair);
-    }
+const operationStatus = Effect.fn("WatchmanToolkit.operationStatus")(function* (input: {
+  readonly operation_id: string;
+  readonly wait_seconds?: number | undefined;
+}) {
+  const tool = "watchman_operation_status";
+  yield* requireCapability(tool);
+  const separator = input.operation_id.indexOf(":");
+  if (separator < 1 || separator === input.operation_id.length - 1) {
+    return yield* fail(
+      tool,
+      "controller",
+      "operation_id must use the correlated hvac:<id>, hvac-hall:<id>, hvac-head:<id>, or tv:<id> form.",
+    );
   }
-  return [..."ABCD"].filter((pair) => have.has(pair)).join("") || "None";
-};
+  const subsystem = input.operation_id.slice(0, separator);
+  const requestId = input.operation_id.slice(separator + 1);
+  if (
+    !/^[a-zA-Z0-9._-]{1,128}$/.test(requestId) ||
+    !["hvac", "hvac-hall", "hvac-head", "tv"].includes(subsystem)
+  ) {
+    return yield* fail(
+      tool,
+      "controller",
+      "operation_id must use the correlated hvac:<id>, hvac-hall:<id>, hvac-head:<id>, or tv:<id> form.",
+    );
+  }
+
+  const deadline =
+    DateTime.toEpochMillis(yield* DateTime.now) +
+    (input.wait_seconds === undefined ? 0 : input.wait_seconds * 1_000);
+
+  if (["hvac", "hvac-hall", "hvac-head"].includes(subsystem)) {
+    const statusService =
+      subsystem === "hvac-hall"
+        ? "hall_request_status"
+        : subsystem === "hvac-head"
+          ? "head_request_status"
+          : "request_status";
+    let receipt: Record<string, unknown>;
+    while (true) {
+      const raw = yield* callServiceResponse(tool, statusService, {
+        request_id: requestId,
+      });
+      if (raw.status === "not_found" && raw.receipt === null) {
+        if (raw.request_id !== requestId) {
+          return yield* fail(tool, "invalid_response", "HVAC status receipt lost correlation.");
+        }
+        return mutationResult({
+          operationId: input.operation_id,
+          requested: { request_id: requestId },
+          accepted: "not_found",
+          applied: "unavailable",
+          observed: {
+            request_id: requestId,
+            hall_execution: raw.hall_execution,
+            head_execution: raw.head_execution,
+            monitor: raw.monitor,
+            samsung_writes: raw.samsung_writes,
+          },
+          evidence: `No durable ${subsystem} receipt exists for request_id ${requestId}.`,
+        });
+      }
+      receipt = hvacStatusView(raw);
+      if (receipt.request_id !== requestId || hvacReceiptApplied(receipt) === undefined) {
+        return yield* fail(tool, "invalid_response", "HVAC status receipt lost correlation.");
+      }
+      if (hvacReceiptApplied(receipt) !== "pending") break;
+      const now = DateTime.toEpochMillis(yield* DateTime.now);
+      if (now >= deadline) break;
+      yield* Effect.sleep(Duration.millis(Math.min(500, deadline - now)));
+    }
+    const applied = hvacReceiptApplied(receipt)!;
+    return mutationResult({
+      operationId: input.operation_id,
+      requested: receipt.requested ?? { request_id: requestId },
+      accepted: receipt.accepted ?? true,
+      applied,
+      observed: {
+        request_id: requestId,
+        effective_pair_mask: receipt.effective_pair_mask,
+        applied_pair_mask: receipt.applied_pair_mask,
+        effective_head_mask: receipt.effective_head_mask,
+        applied_head_mask: receipt.applied_head_mask,
+        terminal_at: receipt.terminal_at,
+        execution: hvacExecutionForStatus(receipt),
+        hall_execution: receipt.hall_execution,
+        head_execution: receipt.head_execution,
+        monitor: receipt.monitor,
+        samsung_writes: receipt.samsung_writes,
+      },
+      evidence:
+        typeof receipt.evidence === "string"
+          ? receipt.evidence
+          : `request_id ${requestId} is ${applied}.`,
+      safety: receipt.safety,
+    });
+  }
+
+  const spool = yield* TvdSpool.TvdSpool;
+  while (true) {
+    const receiptResult = yield* Effect.result(spool.readReceipt(requestId));
+    if (Result.isSuccess(receiptResult)) {
+      return {
+        operation_id: input.operation_id,
+        ...receiptResult.success,
+      };
+    }
+    if (receiptResult.failure.reason !== "not_found") {
+      return yield* tvdController(tool, Effect.fail(receiptResult.failure));
+    }
+    const now = DateTime.toEpochMillis(yield* DateTime.now);
+    if (now >= deadline) {
+      return mutationResult({
+        operationId: input.operation_id,
+        requested: { request_id: requestId },
+        accepted: "filed",
+        applied: "pending",
+        observed: { request_id: requestId },
+        evidence: `No terminal tvd receipt exists yet for request_id ${requestId}.`,
+      });
+    }
+    yield* Effect.sleep(
+      Duration.millis(Math.min(Math.max(1, spool.receiptPollIntervalMs), deadline - now)),
+    );
+  }
+});
 
 const hvacControl = Effect.fn("WatchmanToolkit.hvacControl")(function* (input: {
-  readonly operation: "target" | "pairs" | "mode" | "party" | "hall";
+  readonly operation: "target" | "pairs" | "heads" | "mode" | "party" | "hall";
   readonly target_f?: number | undefined;
   readonly heads?: ReadonlyArray<number> | undefined;
-  readonly action?: "on" | "off" | "only" | "start" | "end" | undefined;
-  readonly fan_mode?: "medium" | "high" | undefined;
+  readonly pairs?: ReadonlyArray<"A" | "B" | "C" | "D"> | undefined;
+  readonly action?: "start" | "end" | undefined;
+  readonly power?: "on" | "off" | undefined;
+  readonly selection?: "preserve" | "only" | undefined;
+  readonly head_mode?: "auto" | "cool" | "dry" | "fan_only" | "heat" | undefined;
+  readonly fan_mode?: "auto" | "low" | "medium" | "high" | undefined;
+  readonly swing_mode?: "off" | "vertical" | undefined;
   readonly mode?: "Auto" | "Manual" | "Off" | undefined;
   readonly minutes?: number | undefined;
-  readonly hall_mode?: "cool" | "heat" | "off" | undefined;
+  readonly hall_mode?: "cool" | "heat" | "fan_only" | "dry" | "heat_cool" | "off" | undefined;
   readonly hall_setpoint_f?: number | undefined;
+  readonly hall_fan_mode?: "quiet" | "low" | "medium" | "high" | "auto" | "strong" | undefined;
+  readonly hall_swing_mode?: "stopped" | "rangefull" | undefined;
 }) {
   const tool = "watchman_hvac_control";
-  yield* requireCapability(tool);
+  const invocation = yield* requireCapability(tool);
   const allowed =
     input.operation === "target"
       ? ["operation", "target_f"]
       : input.operation === "pairs"
-        ? ["operation", "heads", "action", "target_f", "fan_mode"]
-        : input.operation === "mode"
-          ? ["operation", "mode"]
-          : input.operation === "party"
-            ? input.action === "start"
-              ? ["operation", "action", "minutes", "target_f"]
-              : ["operation", "action"]
-            : ["operation", "hall_mode", "hall_setpoint_f"];
+        ? ["operation", "pairs", "target_f", "fan_mode", "minutes"]
+        : input.operation === "heads"
+          ? [
+              "operation",
+              "heads",
+              "power",
+              "selection",
+              "head_mode",
+              "target_f",
+              "fan_mode",
+              "swing_mode",
+              "minutes",
+            ]
+          : input.operation === "mode"
+            ? ["operation", "mode", "minutes"]
+            : input.operation === "party"
+              ? input.action === "start"
+                ? ["operation", "action", "minutes", "target_f"]
+                : ["operation", "action"]
+              : ["operation", "hall_mode", "hall_setpoint_f", "hall_fan_mode", "hall_swing_mode"];
   const irrelevant = irrelevantParameter(tool, input, allowed);
   if (irrelevant) return yield* irrelevant;
   const before = yield* readStates(tool);
-  let requestedPairs: string | undefined;
+  const v3Controller = before.get("sensor.watchman_hvac_controller");
+  const v3Available = v3Controller?.attributes.actuation_compiled_in === true;
 
-  if (input.operation === "target") {
-    if (input.target_f === undefined)
-      return yield* fail(tool, "controller", "target requires target_f.");
-    yield* callService(tool, "input_number", "set_value", {
-      entity_id: "input_number.hvac_party_setpoint_f",
-      value: input.target_f,
-    });
-  } else if (input.operation === "pairs") {
-    if (!input.heads?.length || !["on", "off", "only"].includes(input.action ?? "")) {
-      return yield* fail(tool, "controller", "pairs requires heads and on, off, or only.");
+  if (input.operation === "hall" && v3Available) {
+    if (
+      input.hall_setpoint_f === undefined &&
+      input.hall_mode === undefined &&
+      input.hall_fan_mode === undefined &&
+      input.hall_swing_mode === undefined
+    ) {
+      return yield* fail(
+        tool,
+        "controller",
+        "hall requires hall_mode, hall_setpoint_f, hall_fan_mode, or hall_swing_mode.",
+      );
     }
-    const selected = selectedPairMask(input.heads);
-    const mode = stateValue(before, "input_select.hvac_mode");
-    const stored = stateValue(before, "input_select.hvac_requested_pairs");
-    const current =
-      ["Party", "Manual"].includes(mode) && /^(?:None|[A-D]+)$/.test(stored)
-        ? stored
-        : [..."ABCD"]
-            .filter(
-              (pair) =>
-                stateValue(before, `binary_sensor.hvac_pair_${pair.toLowerCase()}_active`) === "on",
-            )
-            .join("") || "None";
-    requestedPairs = updatePairMask(current, selected, input.action as "on" | "off" | "only");
-    yield* callService(tool, "input_select", "select_option", {
-      entity_id: "input_select.hvac_requested_pairs",
-      option: requestedPairs,
-    });
-    if (input.target_f !== undefined) {
-      yield* callService(tool, "input_number", "set_value", {
-        entity_id: "input_number.hvac_party_setpoint_f",
-        value: input.target_f,
+    if (
+      input.hall_mode === "off" &&
+      [input.hall_setpoint_f, input.hall_fan_mode, input.hall_swing_mode].some(
+        (value) => value !== undefined,
+      )
+    ) {
+      return yield* fail(tool, "controller", "hall off does not accept active settings.");
+    }
+    if (input.hall_mode === "fan_only" && input.hall_setpoint_f !== undefined) {
+      return yield* fail(tool, "controller", "hall fan_only does not accept hall_setpoint_f.");
+    }
+    const crypto = yield* Crypto.Crypto;
+    const requestId = (yield* crypto.randomUUIDv4.pipe(
+      Effect.mapError((cause) => fail(tool, "controller", cause.message)),
+    )).toLowerCase();
+    return yield* submitVerifiedHvacV3(
+      tool,
+      "hall_request",
+      {
+        request_id: requestId,
+        ...(input.hall_mode === undefined ? {} : { hvac_mode: input.hall_mode }),
+        ...(input.hall_setpoint_f === undefined ? {} : { setpoint_f: input.hall_setpoint_f }),
+        ...(input.hall_fan_mode === undefined ? {} : { fan_mode: input.hall_fan_mode }),
+        ...(input.hall_swing_mode === undefined ? {} : { swing_mode: input.hall_swing_mode }),
+      },
+      input,
+      { operationPrefix: "hvac-hall", statusService: "hall_request_status" },
+    );
+  }
+
+  if (input.operation === "pairs") {
+    if (!invocation.capabilities.has("watchman-developer-control")) {
+      return yield* fail(
+        tool,
+        "capability",
+        "Manual HVAC pair selection is available only in the Watchman Developer environment.",
+      );
+    }
+    if (!input.pairs?.length) {
+      return yield* fail(
+        tool,
+        "controller",
+        "pairs requires at least one explicit pair label A-D.",
+      );
+    }
+    if (new Set(input.pairs).size !== input.pairs.length) {
+      return yield* fail(tool, "controller", "pair labels must be unique.");
+    }
+    if (input.fan_mode !== undefined && !["medium", "high"].includes(input.fan_mode)) {
+      return yield* fail(tool, "controller", "manual fan_mode must be medium or high.");
+    }
+    const pairIndex = { A: 0, B: 1, C: 2, D: 3 } as const;
+    const pairMask = input.pairs.reduce((mask, pair) => mask | (1 << pairIndex[pair]), 0);
+    const expandedHeads = [1, 2, 3, 4, 5, 6, 7, 8].filter(
+      (head) => (pairMask & (1 << Math.floor((head - 1) / 2))) !== 0,
+    );
+    if (!v3Available) {
+      return mutationResult({
+        requested: { ...input, pair_mask: pairMask, expanded_heads: expandedHeads },
+        accepted: "unavailable(v3_controller_not_cut_over)",
+        applied: "unavailable",
+        observed: { controller_state: v3Controller?.state ?? "unavailable" },
+        evidence:
+          "Developer pair control requires the verified HVAC v3 actuator. No legacy helper write was sent.",
       });
     }
-    if (input.fan_mode !== undefined) {
-      yield* callService(tool, "input_select", "select_option", {
-        entity_id: "input_select.hvac_operator_fan",
-        option: input.fan_mode,
+    const crypto = yield* Crypto.Crypto;
+    const requestId = (yield* crypto.randomUUIDv4.pipe(
+      Effect.mapError((cause) => fail(tool, "controller", cause.message)),
+    )).toLowerCase();
+    return yield* submitVerifiedHvacV3(
+      tool,
+      "developer_pair_request",
+      {
+        request_id: requestId,
+        pair_mask: pairMask,
+        ...(input.target_f === undefined ? {} : { setpoint_f: input.target_f }),
+        ...(input.fan_mode === undefined ? {} : { fan_mode: input.fan_mode }),
+        ...(input.minutes === undefined ? {} : { duration_minutes: input.minutes }),
+      },
+      { ...input, pair_mask: pairMask, expanded_heads: expandedHeads },
+    );
+  }
+
+  if (input.operation === "heads") {
+    if (!input.heads?.length || input.power === undefined) {
+      return yield* fail(tool, "controller", "heads requires heads and power on or off.");
+    }
+    if (new Set(input.heads).size !== input.heads.length) {
+      return yield* fail(tool, "controller", "heads must be unique.");
+    }
+    if (input.selection === "only" && input.power !== "on") {
+      return yield* fail(tool, "controller", "selection only requires power on.");
+    }
+    if (
+      input.power === "off" &&
+      [input.head_mode, input.target_f, input.fan_mode, input.swing_mode].some(
+        (value) => value !== undefined,
+      )
+    ) {
+      return yield* fail(tool, "controller", "power off does not accept active settings.");
+    }
+    if (input.head_mode === "fan_only" && input.target_f !== undefined) {
+      return yield* fail(tool, "controller", "fan_only does not accept target_f.");
+    }
+    if (!v3Available) {
+      return mutationResult({
+        requested: input,
+        accepted: "unavailable(v3_exact_head_not_cut_over)",
+        applied: "unavailable",
+        observed: {
+          controller_state: v3Controller?.state ?? "unavailable",
+          exact_head_control: v3Controller?.attributes.exact_head_control ?? false,
+        },
+        evidence:
+          "Exact-head control requires the verified HVAC v3 actuator. No legacy helper write was sent, and the requested head was not broadened to its pair.",
       });
     }
-    if (!["Party", "Manual"].includes(mode)) {
-      yield* callService(tool, "input_select", "select_option", {
-        entity_id: "input_select.hvac_mode",
-        option: "Manual",
-      });
-    }
-    yield* callService(tool, "script", "turn_on", {
-      entity_id: "script.hvac_operator_reconcile",
-    });
-  } else if (input.operation === "mode") {
-    if (!input.mode) return yield* fail(tool, "controller", "mode requires Auto, Manual, or Off.");
-    yield* callService(tool, "input_select", "select_option", {
-      entity_id: "input_select.hvac_mode",
-      option: input.mode,
-    });
-    yield* callService(tool, "script", "turn_on", {
-      entity_id: "script.hvac_operator_reconcile",
-    });
-  } else if (input.operation === "party") {
-    if (input.action === "start") {
-      if (input.minutes === undefined) {
+    const crypto = yield* Crypto.Crypto;
+    const requestId = (yield* crypto.randomUUIDv4.pipe(
+      Effect.mapError((cause) => fail(tool, "controller", cause.message)),
+    )).toLowerCase();
+    return yield* submitVerifiedHvacV3(
+      tool,
+      "head_request",
+      {
+        request_id: requestId,
+        heads: input.heads,
+        power: input.power,
+        ...(input.selection === undefined ? {} : { selection: input.selection }),
+        ...(input.head_mode === undefined ? {} : { hvac_mode: input.head_mode }),
+        ...(input.target_f === undefined ? {} : { setpoint_f: input.target_f }),
+        ...(input.fan_mode === undefined ? {} : { fan_mode: input.fan_mode }),
+        ...(input.swing_mode === undefined ? {} : { swing_mode: input.swing_mode }),
+        ...(input.minutes === undefined ? {} : { duration_minutes: input.minutes }),
+      },
+      input,
+      { operationPrefix: "hvac-head", statusService: "head_request_status" },
+    );
+  }
+
+  if (v3Available) {
+    const crypto = yield* Crypto.Crypto;
+    const requestId = (yield* crypto.randomUUIDv4.pipe(
+      Effect.mapError((cause) => fail(tool, "controller", cause.message)),
+    )).toLowerCase();
+    const service = "request" as const;
+    let payload: Record<string, unknown>;
+
+    if (input.operation === "target") {
+      if (input.target_f === undefined) {
+        return yield* fail(tool, "controller", "target requires target_f.");
+      }
+      payload = {
+        request_id: requestId,
+        action: "party",
+        setpoint_f: input.target_f,
+        duration_minutes: 60,
+      };
+    } else if (input.operation === "party") {
+      if (input.action === "start") {
+        payload = {
+          request_id: requestId,
+          action: "party",
+          duration_minutes: input.minutes ?? 60,
+          ...(input.target_f === undefined ? {} : { setpoint_f: input.target_f }),
+        };
+      } else if (input.action === "end") {
+        payload = { request_id: requestId, action: "auto" };
+      } else {
+        return yield* fail(tool, "controller", "party requires start or end.");
+      }
+    } else if (input.operation === "mode") {
+      if (input.mode === "Auto") {
+        if (input.minutes !== undefined) {
+          return yield* fail(tool, "controller", "Auto does not accept minutes.");
+        }
+        payload = { request_id: requestId, action: "auto" };
+      } else if (input.mode === "Off") {
+        payload = {
+          request_id: requestId,
+          action: "off",
+          ...(input.minutes === undefined ? {} : { duration_minutes: input.minutes }),
+        };
+      } else if (input.mode === "Manual") {
         return yield* fail(
           tool,
           "controller",
-          "Party start requires an explicit duration so an existing lease is never shortened implicitly.",
+          "Manual requires a Developer operation=pairs request with the desired pair members.",
         );
+      } else {
+        return yield* fail(tool, "controller", "mode requires Auto, Manual, or Off.");
       }
-      if (input.target_f !== undefined) {
+    } else {
+      return yield* fail(tool, "controller", "Unsupported HVAC operation.");
+    }
+
+    return yield* submitVerifiedHvacV3(tool, service, payload, input);
+  }
+
+  return yield* mutationSemaphore.withPermits(1)(
+    Effect.gen(function* () {
+      const crypto = yield* Crypto.Crypto;
+      const v2CorrelationId = `hvac-v2:${(yield* crypto.randomUUIDv4.pipe(
+        Effect.mapError((cause) => fail(tool, "controller", cause.message)),
+      )).toLowerCase()}`;
+      if (input.operation === "target") {
+        if (input.target_f === undefined)
+          return yield* fail(tool, "controller", "target requires target_f.");
         yield* callService(tool, "input_number", "set_value", {
           entity_id: "input_number.hvac_party_setpoint_f",
           value: input.target_f,
         });
+      } else if (input.operation === "mode") {
+        if (!input.mode)
+          return yield* fail(tool, "controller", "mode requires Auto, Manual, or Off.");
+        if (input.minutes !== undefined) {
+          return yield* fail(
+            tool,
+            "unavailable",
+            "Timed Off requires the verified HVAC v3 controller cutover.",
+          );
+        }
+        yield* callService(tool, "input_select", "select_option", {
+          entity_id: "input_select.hvac_mode",
+          option: input.mode,
+        });
+        yield* callService(tool, "script", "turn_on", {
+          entity_id: "script.hvac_operator_reconcile",
+        });
+      } else if (input.operation === "party") {
+        if (input.action === "start") {
+          if (input.target_f !== undefined) {
+            yield* callService(tool, "input_number", "set_value", {
+              entity_id: "input_number.hvac_party_setpoint_f",
+              value: input.target_f,
+            });
+          }
+          yield* callService(tool, "script", "turn_on", {
+            entity_id: "script.hvac_party_start",
+            variables: { hours: (input.minutes ?? 60) / 60 },
+          });
+        } else if (input.action === "end") {
+          yield* callService(tool, "script", "turn_on", {
+            entity_id: "script.hvac_party_end",
+          });
+        } else {
+          return yield* fail(tool, "controller", "party requires start or end.");
+        }
+      } else {
+        if (
+          input.hall_setpoint_f === undefined &&
+          input.hall_mode === undefined &&
+          input.hall_fan_mode === undefined &&
+          input.hall_swing_mode === undefined
+        ) {
+          return yield* fail(
+            tool,
+            "controller",
+            "hall requires hall_mode, hall_setpoint_f, hall_fan_mode, or hall_swing_mode.",
+          );
+        }
+        if (
+          input.hall_mode === "off" &&
+          [input.hall_setpoint_f, input.hall_fan_mode, input.hall_swing_mode].some(
+            (value) => value !== undefined,
+          )
+        ) {
+          return yield* fail(tool, "controller", "hall off does not accept active settings.");
+        }
+        if (input.hall_mode === "fan_only" && input.hall_setpoint_f !== undefined) {
+          return yield* fail(tool, "controller", "hall fan_only does not accept hall_setpoint_f.");
+        }
+        if (input.hall_fan_mode !== undefined || input.hall_swing_mode !== undefined) {
+          return yield* fail(
+            tool,
+            "unavailable",
+            "Hall fan and swing require the verified HVAC v3 controller cutover.",
+          );
+        }
+        if (input.hall_setpoint_f !== undefined && !hallCelsius.has(input.hall_setpoint_f)) {
+          return yield* fail(
+            tool,
+            "unavailable",
+            "Hall setpoints outside 75-85F require the verified HVAC v3 controller cutover.",
+          );
+        }
+        if (input.hall_setpoint_f !== undefined) {
+          yield* callService(tool, "climate", "set_temperature", {
+            entity_id: "climate.hvac_inverter_hall",
+            temperature: hallCelsius.get(input.hall_setpoint_f),
+          });
+        }
+        if (input.hall_mode !== undefined) {
+          yield* callService(tool, "climate", "set_hvac_mode", {
+            entity_id: "climate.hvac_inverter_hall",
+            hvac_mode: input.hall_mode,
+          });
+        }
       }
-      yield* callService(tool, "script", "turn_on", {
-        entity_id: "script.hvac_party_start",
-        variables: { hours: input.minutes / 60 },
-      });
-    } else if (input.action === "end") {
-      yield* callService(tool, "script", "turn_on", {
-        entity_id: "script.hvac_party_end",
-      });
-    } else {
-      return yield* fail(tool, "controller", "party requires start or end.");
-    }
-  } else {
-    if (input.hall_setpoint_f === undefined && input.hall_mode === undefined) {
-      return yield* fail(tool, "controller", "hall requires hall_setpoint_f or hall_mode.");
-    }
-    if (input.hall_setpoint_f !== undefined) {
-      yield* callService(tool, "climate", "set_temperature", {
-        entity_id: "climate.hvac_inverter_hall",
-        temperature: hallCelsius.get(input.hall_setpoint_f),
-      });
-    }
-    if (input.hall_mode !== undefined) {
-      yield* callService(tool, "climate", "set_hvac_mode", {
-        entity_id: "climate.hvac_inverter_hall",
-        hvac_mode: input.hall_mode,
-      });
-    }
-  }
 
-  const states = yield* readStates(tool);
-  const directPairs = attribute(states, "sensor.watchman_hvac_controller", "pair_states");
-  const appliedPairs =
-    directPairs && typeof directPairs === "object"
-      ? [..."ABCD"]
-          .filter((pair) => (directPairs as Record<string, unknown>)[pair] === "full_on")
-          .join("") || "None"
-      : undefined;
-  const applied =
-    requestedPairs !== undefined &&
-    appliedPairs !== undefined &&
-    requestedPairs === appliedPairs &&
-    input.operation === "pairs" &&
-    input.target_f === undefined &&
-    input.fan_mode === undefined
-      ? "verified"
-      : "pending";
-  return mutationResult({
-    requested: { ...input, requested_pairs: requestedPairs },
-    applied,
-    observed: statusForArea(states, "hvac"),
-    evidence:
-      applied === "verified"
-        ? "Direct controller pair state matches the requested complete-pair mask."
-        : input.operation === "hall"
-          ? "Sensibo is cloud-reported/open-loop; Home Assistant accepted the request."
-          : "Home Assistant accepted the controller/helper request, but direct applied state is pending, unavailable, or safety-clamped.",
-    safety: {
-      guard_cap: stateValue(states, "sensor.hvac_guard_cap"),
-      controller_reason: stateValue(states, "sensor.hvac_controller_reason"),
-    },
-  });
+      const states = yield* readStates(tool);
+      if (input.operation === "hall") {
+        return mutationResult({
+          requested: input,
+          applied: "pending",
+          observed: statusForArea(states, "hvac"),
+          evidence: "Sensibo is cloud-reported/open-loop; Home Assistant accepted the request.",
+          safety: {
+            guard_cap: stateValue(states, "sensor.hvac_guard_cap"),
+            controller_reason: stateValue(states, "sensor.hvac_controller_reason"),
+          },
+        });
+      }
+      return {
+        ...mutationResult({
+          requested: input,
+          accepted: "submitted_unverified",
+          applied: "pending",
+          observed: statusForArea(states, "hvac"),
+          evidence: `Legacy HVAC request ${v2CorrelationId} was submitted, but v2 has no request-correlated applied-state receipt. This remains pending and must not be reported as completed.`,
+          safety: {
+            guard_cap: stateValue(states, "sensor.hvac_guard_cap"),
+            controller_reason: stateValue(states, "sensor.hvac_controller_reason"),
+          },
+        }),
+        correlation_id: v2CorrelationId,
+        status_tracking: "unavailable(v2_no_durable_receipt)",
+      };
+    }),
+  );
 });
 
 const waterControl = Effect.fn("WatchmanToolkit.waterControl")(function* (input: {
@@ -1221,8 +1749,9 @@ const automation = Effect.fn("WatchmanToolkit.automation")(function* () {
 const handlers = {
   watchman_status: status,
   watchman_history: history,
+  watchman_operation_status: operationStatus,
   watchman_tv_control: tvControl,
-  watchman_hvac_control: (input) => mutationSemaphore.withPermits(1)(hvacControl(input)),
+  watchman_hvac_control: hvacControl,
   watchman_water_control: (input) => mutationSemaphore.withPermits(1)(waterControl(input)),
   watchman_automation: automation,
 } satisfies Parameters<typeof WatchmanToolkit.toLayer>[0];

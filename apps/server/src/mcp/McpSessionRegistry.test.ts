@@ -69,6 +69,30 @@ it.effect("adds physical control only when the caller explicitly scopes the cred
   }),
 );
 
+it.effect("adds developer control only alongside ordinary Watchman control", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1_000);
+    const developer = yield* registry.issue({
+      threadId: ThreadId.make("thread-watchman-developer"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      includeWatchmanControl: true,
+      includeWatchmanDeveloperControl: true,
+    });
+    const developerToken = developer.config.authorizationHeader.replace(/^Bearer\s+/, "");
+    expect((yield* registry.resolve(developerToken))?.capabilities).toEqual(
+      new Set(["preview", "watchman-control", "watchman-developer-control"]),
+    );
+
+    const unscoped = yield* registry.issue({
+      threadId: ThreadId.make("thread-watchman-developer-unscoped"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      includeWatchmanDeveloperControl: true,
+    });
+    const unscopedToken = unscoped.config.authorizationHeader.replace(/^Bearer\s+/, "");
+    expect((yield* registry.resolve(unscopedToken))?.capabilities).toEqual(new Set(["preview"]));
+  }),
+);
+
 it.effect("changes physical control on the existing credential when the agent changes", () =>
   Effect.gen(function* () {
     const registry = yield* makeRegistry(() => 1_000);
@@ -80,11 +104,31 @@ it.effect("changes physical control on the existing credential when the agent ch
     const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
 
     expect((yield* registry.resolve(token))?.capabilities).toEqual(new Set(["preview"]));
-    yield* registry.setWatchmanControl(threadId, true);
+    yield* registry.setWatchmanCapabilities(threadId, {
+      watchmanControl: true,
+      watchmanDeveloperControl: false,
+    });
     expect((yield* registry.resolve(token))?.capabilities).toEqual(
       new Set(["preview", "watchman-control"]),
     );
-    yield* registry.setWatchmanControl(threadId, false);
+    yield* registry.setWatchmanCapabilities(threadId, {
+      watchmanControl: true,
+      watchmanDeveloperControl: true,
+    });
+    expect((yield* registry.resolve(token))?.capabilities).toEqual(
+      new Set(["preview", "watchman-control", "watchman-developer-control"]),
+    );
+    yield* registry.setWatchmanCapabilities(threadId, {
+      watchmanControl: true,
+      watchmanDeveloperControl: false,
+    });
+    expect((yield* registry.resolve(token))?.capabilities).toEqual(
+      new Set(["preview", "watchman-control"]),
+    );
+    yield* registry.setWatchmanCapabilities(threadId, {
+      watchmanControl: false,
+      watchmanDeveloperControl: true,
+    });
     expect((yield* registry.resolve(token))?.capabilities).toEqual(new Set(["preview"]));
   }),
 );

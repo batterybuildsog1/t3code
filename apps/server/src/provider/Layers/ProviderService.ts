@@ -92,6 +92,19 @@ export function shouldGrantWatchmanControlCapability(input: {
   );
 }
 
+export function shouldGrantWatchmanDeveloperControlCapability(input: {
+  readonly modelSelection?: ModelSelection | undefined;
+  readonly cwd?: string | undefined;
+  readonly projectRoot?: string | undefined;
+}): boolean {
+  return (
+    getModelSelectionStringOptionValue(input.modelSelection, "agent") ===
+      WATCHMAN_DEVELOPER_AGENT &&
+    typeof input.projectRoot === "string" &&
+    isWatchmanProjectWorkspace(input.cwd, input.projectRoot)
+  );
+}
+
 export function isWatchmanControlProviderSelectionAllowed(input: {
   readonly modelSelection?: ModelSelection | undefined;
   readonly providerInstanceId: ProviderInstanceId;
@@ -267,16 +280,23 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     provider: ProviderDriverKind,
     modelSelection?: ModelSelection,
     cwd?: string,
-  ) =>
-    McpSessionRegistry.issueActiveMcpCredential({
+  ) => {
+    const projectRoot = resolveWatchmanProjectRoot();
+    const effectiveCwd = cwd ?? serverConfig.cwd;
+    return McpSessionRegistry.issueActiveMcpCredential({
       threadId,
       providerInstanceId,
       includeWatchmanControl: shouldGrantWatchmanControlCapability({
         modelSelection,
         providerInstanceId,
         provider,
-        cwd: cwd ?? serverConfig.cwd,
-        projectRoot: resolveWatchmanProjectRoot(),
+        cwd: effectiveCwd,
+        projectRoot,
+      }),
+      includeWatchmanDeveloperControl: shouldGrantWatchmanDeveloperControlCapability({
+        modelSelection,
+        cwd: effectiveCwd,
+        projectRoot,
       }),
     }).pipe(
       Effect.tap((credential) =>
@@ -285,6 +305,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           : Effect.void,
       ),
     );
+  };
   const clearMcpSession = (threadId: ThreadId) =>
     McpSessionRegistry.revokeActiveMcpThread(threadId).pipe(
       Effect.tap(() => Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId))),
@@ -812,22 +833,40 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           "Watchman Control conversations must use an OpenCode provider.",
         );
       }
-      const previousWatchmanControl = shouldGrantWatchmanControlCapability({
-        modelSelection: persistedModelSelection,
-        providerInstanceId: routed.instanceId,
-        provider: routed.adapter.provider,
-        cwd: effectiveCwd,
-        projectRoot: resolveWatchmanProjectRoot(),
-      });
-      const requestedWatchmanControl = shouldGrantWatchmanControlCapability({
-        modelSelection: effectiveModelSelection,
-        providerInstanceId: routed.instanceId,
-        provider: routed.adapter.provider,
-        cwd: effectiveCwd,
-        projectRoot: resolveWatchmanProjectRoot(),
-      });
+      const projectRoot = resolveWatchmanProjectRoot();
+      const previousWatchmanCapabilities = {
+        watchmanControl: shouldGrantWatchmanControlCapability({
+          modelSelection: persistedModelSelection,
+          providerInstanceId: routed.instanceId,
+          provider: routed.adapter.provider,
+          cwd: effectiveCwd,
+          projectRoot,
+        }),
+        watchmanDeveloperControl: shouldGrantWatchmanDeveloperControlCapability({
+          modelSelection: persistedModelSelection,
+          cwd: effectiveCwd,
+          projectRoot,
+        }),
+      };
+      const requestedWatchmanCapabilities = {
+        watchmanControl: shouldGrantWatchmanControlCapability({
+          modelSelection: effectiveModelSelection,
+          providerInstanceId: routed.instanceId,
+          provider: routed.adapter.provider,
+          cwd: effectiveCwd,
+          projectRoot,
+        }),
+        watchmanDeveloperControl: shouldGrantWatchmanDeveloperControlCapability({
+          modelSelection: effectiveModelSelection,
+          cwd: effectiveCwd,
+          projectRoot,
+        }),
+      };
       const turn = yield* Effect.acquireUseRelease(
-        McpSessionRegistry.setActiveMcpWatchmanControl(input.threadId, requestedWatchmanControl),
+        McpSessionRegistry.setActiveMcpWatchmanCapabilities(
+          input.threadId,
+          requestedWatchmanCapabilities,
+        ),
         () =>
           // The OpenCode process keeps using the same bearer token; update
           // that credential's current authority and liveness instead of
@@ -838,9 +877,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         (_, dispatchExit) =>
           Exit.isSuccess(dispatchExit)
             ? Effect.void
-            : McpSessionRegistry.setActiveMcpWatchmanControl(
+            : McpSessionRegistry.setActiveMcpWatchmanCapabilities(
                 input.threadId,
-                previousWatchmanControl,
+                previousWatchmanCapabilities,
               ),
       );
       const previousRuntimePayload =

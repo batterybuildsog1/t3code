@@ -5,6 +5,8 @@ export const WATCHMAN_DEVELOPER_AGENT = "watchman-developer";
 export const WATCHMAN_CONTROL_PROVIDER_INSTANCE_ID = "opencode";
 export const WATCHMAN_DEVELOPER_UNLOCK_KEY = "watchman:developer-unlocked";
 
+export type WatchmanSurface = "control" | "developer" | null;
+
 type UnlockStorage = Pick<Storage, "getItem" | "setItem">;
 
 function browserStorage(): UnlockStorage | null {
@@ -20,6 +22,16 @@ export function selectedWatchmanAgent(
 ): string | undefined {
   const value = modelSelection.options?.find((option) => option.id === "agent")?.value;
   return typeof value === "string" ? value : undefined;
+}
+
+export function watchmanSurfaceForModelSelection(
+  modelSelection: Pick<ModelSelection, "options"> | null | undefined,
+): WatchmanSurface {
+  if (!modelSelection) return null;
+  const agent = selectedWatchmanAgent(modelSelection);
+  if (agent === WATCHMAN_CONTROL_AGENT) return "control";
+  if (agent === WATCHMAN_DEVELOPER_AGENT) return "developer";
+  return null;
 }
 
 export function resolveWatchmanNewConversationModelSelection(input: {
